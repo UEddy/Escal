@@ -17,18 +17,25 @@ import re
 import subprocess
 import sys
 import textwrap
+import unicodedata
 from pathlib import Path
 
 import pytest
 
 from signature import (
     FIELD_SPEC,
+    PENDING_ACTIONS,
+    POLICY_RULES,
     REQUIRED_FIELDS,
     SIGNATURE_VERSION,
+    TOOLS,
+    TRIGGERS,
+    VOCABULARIES,
     InvalidFieldError,
     MissingFieldError,
     SignatureError,
     UnknownFieldError,
+    UnregisteredValueError,
     canonical_form,
     escalation_signature,
     validate_confidence_threshold,
@@ -120,19 +127,25 @@ def test_case_and_surrounding_whitespace_are_normalized(written):
     )
 
 
-def test_internal_whitespace_runs_are_collapsed():
-    assert escalation_signature(variant(pending_action="issue  refund")) == (
-        escalation_signature(variant(pending_action="issue refund"))
+def test_normalization_runs_before_the_vocabulary_lookup():
+    """A caller that shouts a registered id still lands on the pattern. This
+    is the whole reach of normalization now: it equates spellings of one id,
+    never phrasings of one stall."""
+    assert escalation_signature(variant(pending_action="  ISSUE_REFUND ")) == (
+        escalation_signature(variant(pending_action="issue_refund"))
     )
 
 
-def test_unicode_composition_is_normalized():
-    composed = "r\u00e9fund_review"           # single code point e-acute
-    decomposed = "re\u0301fund_review"        # e + combining acute
-    assert composed != decomposed
-    assert escalation_signature(variant(policy_rule=composed)) == (
-        escalation_signature(variant(policy_rule=decomposed))
-    )
+def test_every_registered_value_is_canonical():
+    """Lookup happens after normalization, so a vocabulary entry that is not
+    already canonical is unreachable: nothing a caller passes could ever
+    match it. This pins the invariant the vocabularies are written under."""
+    for field, vocabulary in VOCABULARIES.items():
+        for value in vocabulary:
+            assert value == unicodedata.normalize("NFC", value), (field, value)
+            assert value == value.lower(), (field, value)
+            assert value == " ".join(value.split()), (field, value)
+            assert value, field
 
 
 # ---------------------------------------------------------------------------
@@ -185,17 +198,24 @@ def test_null_field_is_distinct_from_a_populated_one():
     assert escalation_signature(variant(tool=None)) != escalation_signature(FULL)
 
 
-def test_null_field_is_distinct_from_the_string_none():
-    assert escalation_signature(variant(tool=None)) != (
+def test_the_string_none_is_not_a_null_sentinel():
+    """None is the only way to say a field does not apply. A caller that
+    stringifies it cannot quietly land on a different pattern."""
+    with pytest.raises(UnregisteredValueError):
         escalation_signature(variant(tool="none"))
-    )
+    with pytest.raises(UnregisteredValueError):
+        escalation_signature(variant(tool="null"))
 
 
 def test_values_do_not_bleed_between_fields():
-    """A shared value in two swapped fields must not hash the same, or the
-    canonical form is losing the field boundary."""
-    swapped = variant(policy_rule="billing_lookup", tool="refund.over_limit")
-    assert escalation_signature(swapped) != escalation_signature(FULL)
+    """Each value has to sit under its own key in the canonical form, or two
+    fields sharing a value would hash the same. The vocabularies happen to be
+    disjoint today, which makes the swap unconstructible, so this checks the
+    boundary structurally instead."""
+    lines = canonical_form(FULL).splitlines()
+    assert "policy_rule=refund.over_limit" in lines
+    assert "tool=billing_lookup" in lines
+    assert sum(line.startswith("tool=") for line in lines) == 1
 
 
 def test_version_is_carried_in_the_key_and_the_canonical_form():
@@ -320,6 +340,104 @@ def test_every_error_is_a_signature_error():
 
 
 # ---------------------------------------------------------------------------
+# Raise cases: values outside the closed vocabularies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", sorted(REQUIRED_FIELDS))
+def test_unregistered_value_raises_on_every_field(field):
+    with pytest.raises(UnregisteredValueError, match=field):
+        escalation_signature(variant(**{field: "not_a_registered_value"}))
+
+
+@pytest.mark.parametrize(
+    "phrasing",
+    [
+        "could not resolve the policy rule",
+        "policy rule unresolved",
+        "Policy rule could not be resolved for this refund",
+        "the agent was unable to resolve which refund policy applies",
+        "unresolved policy rule",
+    ],
+)
+def test_free_text_phrasings_of_a_real_trigger_all_raise(phrasing):
+    """The failure the vocabularies exist for. Every one of these describes
+    the same stall as the registered policy_rule_unresolved. Before the
+    vocabularies each produced its own pattern with its own counter, and none
+    of them ever reached a threshold. They must not produce a key at all."""
+    with pytest.raises(UnregisteredValueError):
+        escalation_signature(variant(trigger=phrasing))
+
+
+def test_a_value_registered_for_another_field_still_raises():
+    """Vocabularies are per field. A real tool name is not a real action."""
+    with pytest.raises(UnregisteredValueError, match="pending_action"):
+        escalation_signature(variant(pending_action="billing_lookup"))
+    with pytest.raises(UnregisteredValueError, match="tool"):
+        escalation_signature(variant(tool="refund.over_limit"))
+
+
+def test_near_miss_value_raises():
+    """A plural, a typo, or a renamed id fails loudly rather than opening a
+    second pattern beside the one it meant."""
+    for near_miss in ("issue_refunds", "issue-refund", "issuerefund"):
+        with pytest.raises(UnregisteredValueError):
+            escalation_signature(variant(pending_action=near_miss))
+
+
+def test_unregistered_error_names_the_registered_values():
+    """The message has to be actionable at the call site."""
+    with pytest.raises(UnregisteredValueError) as excinfo:
+        escalation_signature(variant(tool="stripe_lookup"))
+    message = str(excinfo.value)
+    assert "stripe_lookup" in message
+    assert all(name in message for name in TOOLS)
+
+
+def test_unregistered_error_truncates_a_long_leaked_value():
+    """A leaked paragraph should be recognizable in the error, not pasted
+    into the log in full."""
+    leaked = "customer says " + "the refund is late " * 5
+    assert len(leaked) < 256  # still passes the length check, fails membership
+    with pytest.raises(UnregisteredValueError) as excinfo:
+        escalation_signature(variant(policy_rule=leaked))
+    assert "..." in str(excinfo.value)
+    assert leaked not in str(excinfo.value)
+
+
+def test_unregistered_value_is_a_signature_error():
+    with pytest.raises(SignatureError):
+        escalation_signature(variant(trigger="something_new"))
+
+
+def test_vocabularies_cover_exactly_the_schema():
+    assert set(VOCABULARIES) == REQUIRED_FIELDS
+    assert all(VOCABULARIES[name] for name in REQUIRED_FIELDS)
+    assert VOCABULARIES["trigger"] is TRIGGERS
+    assert VOCABULARIES["policy_rule"] is POLICY_RULES
+    assert VOCABULARIES["tool"] is TOOLS
+    assert VOCABULARIES["pending_action"] is PENDING_ACTIONS
+
+
+def test_vocabularies_are_immutable():
+    """The memory layer is handed these to validate at its own boundary. It
+    must not be able to widen the key space by mutating them."""
+    for vocabulary in VOCABULARIES.values():
+        assert isinstance(vocabulary, frozenset)
+        with pytest.raises(AttributeError):
+            vocabulary.add("anything")
+
+
+def test_fixtures_are_drawn_from_the_vocabularies():
+    """Keeps the test fixtures honest: they must be values the agent could
+    really produce, not invented strings that only exist here."""
+    for fields in (FULL, SPARSE):
+        for name, value in fields.items():
+            if value is not None:
+                assert value in VOCABULARIES[name], (name, value)
+
+
+# ---------------------------------------------------------------------------
 # The confidence threshold validator, which is not a signature input
 # ---------------------------------------------------------------------------
 
@@ -385,14 +503,36 @@ def test_key_shape_is_a_valid_sibyl_entity_name(fields):
     assert key == key.strip()
 
 
-@pytest.mark.parametrize(
-    "trigger",
-    ["policy rule unresolved!!", "TOOL::result/ambiguous", "\u30a8\u30b9\u30ab\u30ec"],
-)
-def test_key_stays_ascii_and_slug_shaped_whatever_the_trigger(trigger):
+@pytest.mark.parametrize("trigger", sorted(TRIGGERS))
+def test_every_registered_trigger_produces_a_valid_key(trigger):
+    """The vocabulary is the whole key space for this field, so covering it
+    exhaustively covers every key the agent can ever emit."""
     key = escalation_signature(variant(trigger=trigger))
     pattern = rf"esc\.{re.escape(SIGNATURE_VERSION)}\.[a-z0-9-]+\.[0-9a-f]{{16}}"
     assert re.fullmatch(pattern, key), key
+
+
+def test_all_registered_values_produce_distinct_keys():
+    """Nothing in the reachable key space collides. Cheap to check outright
+    now that the space is closed."""
+    keys = set()
+    for trigger in TRIGGERS:
+        for rule in POLICY_RULES | {None}:
+            for tool in TOOLS | {None}:
+                for action in PENDING_ACTIONS | {None}:
+                    keys.add(escalation_signature({
+                        "trigger": trigger,
+                        "policy_rule": rule,
+                        "tool": tool,
+                        "pending_action": action,
+                    }))
+    expected = (
+        len(TRIGGERS)
+        * (len(POLICY_RULES) + 1)
+        * (len(TOOLS) + 1)
+        * (len(PENDING_ACTIONS) + 1)
+    )
+    assert len(keys) == expected
 
 
 def test_sparse_escalation_produces_a_usable_key():

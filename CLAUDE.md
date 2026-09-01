@@ -164,9 +164,47 @@ Rationale:
 - No per-escalation model call. Free tier, zero budget.
 - The demo requires one unbroken take with reproducible recall.
 
-The raw context goes in the entity body so FTS5 can serve as a fuzzy second
-pass when the exact key misses. Lookup order: exact key, then
-`search_entities` anchored to the pattern category, then branch on verdict.
+### Closed vocabularies
+
+Every signature field draws from a closed vocabulary hardcoded in
+`src/signature.py`: `TRIGGERS`, `POLICY_RULES`, `TOOLS`, `PENDING_ACTIONS`,
+exposed together as `VOCABULARIES`. An unregistered value raises
+`UnregisteredValueError`, the same refusal an unknown field gets. Adding a
+value is a deliberate one-line edit in that module.
+
+Determinism without a closed vocabulary is decorative. Normalization equates
+two spellings of one string, but nothing can equate two phrasings of one
+stall, so an open field lets "policy rule unresolved" and "could not resolve
+the policy rule" become two patterns that each accumulate half a counter and
+never reach a threshold. The vocabulary is what makes the key space knowable.
+
+The vocabularies are hardcoded, never loaded from Sibyl. Loading them would
+make the signature module a second reader of memory instead of a pure
+derivation, and caching them would be exactly the convenience cache the hard
+rules forbid. This does not weaken the deletion test: the vocabulary is the
+key space, not the memory. With Sibyl removed there are still no patterns, no
+calibration, and every escalation goes to a human.
+
+Values must be read out of the agent's control state at the point it stalled.
+The branch that decided to escalate knows which branch it is, the tool
+registry knows the tool's name, and the invocation knows the action's name.
+None of these fields may be filled by asking a model to describe the
+escalation.
+
+### The escalation policy document
+
+The policy is a structured document in which every rule carries a stable id.
+`policy_rule` is a lookup key into it, never a quotation from it. The ids in
+`POLICY_RULES` and the ids in the REFERENCE copy are two hands on the same
+rope, so keep them in step: a rule added to the document raises here until it
+is registered, which is the direction the drift should fail in.
+
+Free text never enters the key. The raw context goes in the entity body so
+FTS5 can serve as a fuzzy second pass when the exact key misses. Lookup
+order: exact key, then `search_entities` anchored to the pattern category,
+then branch on verdict. That body is also where user-supplied text lands,
+which is why the search gates matter and why a `GATED` verdict is a signal
+rather than an error to suppress.
 
 ## Memory layout
 
@@ -178,7 +216,8 @@ pass when the exact key misses. Lookup order: exact key, then
   `forward` for what it passed to the human, `extra` for the rest. This is the
   decision audit log.
 - HOT state: current confidence threshold, pending escalation.
-- REFERENCE: the escalation policy document.
+- REFERENCE: the escalation policy document, structured so every rule carries
+  a stable id. Those ids are the `policy_rule` vocabulary, see above.
 
 Validate the confidence threshold with `validate_confidence_threshold` from
 `src/signature.py` wherever it is stored or read back, on the HOT state write

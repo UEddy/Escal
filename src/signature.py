@@ -15,6 +15,18 @@ canonical form before hashing, and anything the schema does not recognize
 raises instead of being dropped. A partial signature is worse than no
 signature: it looks like a valid key and accumulates confidence on the wrong
 pattern.
+
+Every field takes its value from a closed vocabulary declared below. This is
+what makes the determinism worth anything: normalization alone equates two
+spellings of one string, but it cannot equate two phrasings of one stall, so
+an open field would let "policy rule unresolved" and "could not resolve the
+policy rule" become two patterns that each accumulate half a counter and
+never reach a threshold. An unregistered value raises rather than quietly
+minting a new pattern.
+
+Free text has a home, and it is not the key. The raw escalation context goes
+in the entity body, where FTS5 serves it as a fuzzy second pass when the
+exact key misses. Nothing a model phrases at escalation time belongs here.
 """
 
 from __future__ import annotations
@@ -29,10 +41,16 @@ __all__ = [
     "SIGNATURE_VERSION",
     "FIELD_SPEC",
     "REQUIRED_FIELDS",
+    "VOCABULARIES",
+    "TRIGGERS",
+    "POLICY_RULES",
+    "TOOLS",
+    "PENDING_ACTIONS",
     "SignatureError",
     "MissingFieldError",
     "UnknownFieldError",
     "InvalidFieldError",
+    "UnregisteredValueError",
     "escalation_signature",
     "canonical_form",
     "validate_confidence_threshold",
@@ -64,12 +82,90 @@ _MAX_VALUE_LENGTH = 256
 # only. The digest is what identifies the pattern.
 _MAX_SLUG_LENGTH = 48
 
+# How much of an unregistered value to quote back in the error. Enough to
+# recognize what leaked, short enough not to paste a paragraph into a log.
+_MAX_ECHO_LENGTH = 64
+
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 
 
+# --------------------------------------------------------------------------
+# Closed vocabularies
+#
+# Hardcoded here on purpose. The vocabularies are the key space, and the key
+# space has to be knowable without reading the store, or the deletion test
+# stops meaning anything: a vocabulary loaded from Sibyl would make this
+# module a second reader of memory rather than a pure derivation, and a
+# vocabulary cached from Sibyl would be exactly the convenience cache the
+# project forbids.
+#
+# Every entry must already be in canonical form: lowercase, no leading,
+# trailing, or repeated whitespace, NFC. An entry that is not canonical is
+# unreachable, because lookup happens after normalization. There is a test
+# that pins this.
+#
+# Adding a value is a deliberate edit here. That is the point. An id the
+# module has never heard of raises instead of minting a pattern, so the cost
+# of extending the agent is one visible line, and the cost of a typo or a
+# leaked phrase is a loud failure at the call site rather than a pattern that
+# accumulates half a counter forever.
+# --------------------------------------------------------------------------
+
+# Why the agent stalled, read from the branch that decided to escalate. Not a
+# model's description of why it escalated.
+TRIGGERS = frozenset({
+    "policy_rule_unresolved",
+    "conflicting_policy_rules",
+    "tool_result_ambiguous",
+    "tool_unavailable",
+    "confidence_below_threshold",
+    "missing_required_input",
+    "authorization_required",
+})
+
+# Stable rule ids from the escalation policy document. The policy is a
+# structured document in which every rule carries an id, so this field is a
+# lookup key into it and never a quotation from it. These ids and the ids in
+# the REFERENCE copy of the policy are two hands on the same rope: a rule
+# added to the document raises here until it is registered, which is the
+# direction the drift should fail in.
+POLICY_RULES = frozenset({
+    "refund.over_limit",
+    "refund.under_limit",
+    "refund.duplicate_request",
+    "refund.outside_window",
+    "account.identity_unverified",
+    "account.closure_requested",
+    "billing.dispute_open",
+    "escalation.vip_account",
+})
+
+# Tool names as registered with the agent, not descriptions of what a tool
+# returned.
+TOOLS = frozenset({
+    "billing_lookup",
+    "crm_lookup",
+    "order_lookup",
+    "refund_api",
+    "identity_verify",
+})
+
+# The operation the agent was about to invoke, named the way the invocation
+# names it. Not a summary of intent.
+PENDING_ACTIONS = frozenset({
+    "issue_refund",
+    "deny_refund",
+    "close_ticket",
+    "request_identity_document",
+    "escalate_to_billing",
+    "escalate_to_supervisor",
+})
+
+
 class _Field(NamedTuple):
     nullable: bool
+    vocabulary: frozenset[str]
     doc: str
 
 
@@ -88,23 +184,33 @@ class _Field(NamedTuple):
 FIELD_SPEC: Mapping[str, _Field] = {
     "trigger": _Field(
         nullable=False,
+        vocabulary=TRIGGERS,
         doc="Why the agent stalled, as an agent-internal trigger identifier.",
     ),
     "policy_rule": _Field(
         nullable=True,
+        vocabulary=POLICY_RULES,
         doc="Identifier of the policy rule that could not be resolved.",
     ),
     "tool": _Field(
         nullable=True,
+        vocabulary=TOOLS,
         doc="Name of the tool that returned an ambiguous or unusable result.",
     ),
     "pending_action": _Field(
         nullable=True,
+        vocabulary=PENDING_ACTIONS,
         doc="The action the agent was about to take when it stalled.",
     ),
 }
 
 REQUIRED_FIELDS = frozenset(FIELD_SPEC)
+
+# Field name to the values it accepts. Exposed so the memory layer can reject
+# an unregistered value at its own boundary, before it reaches this module.
+VOCABULARIES: Mapping[str, frozenset[str]] = {
+    name: spec.vocabulary for name, spec in FIELD_SPEC.items()
+}
 
 
 class SignatureError(ValueError):
@@ -124,6 +230,21 @@ class InvalidFieldError(SignatureError):
 
     Also raised by validate_confidence_threshold, which is not a signature
     input but shares the error type so callers have one thing to catch.
+    """
+
+
+class UnregisteredValueError(SignatureError):
+    """A field was supplied with a value outside its closed vocabulary.
+
+    The counterpart to UnknownFieldError one level down: that one refuses a
+    key the schema does not declare, this one refuses a value the field does
+    not declare. Both refuse rather than absorb, for the same reason.
+
+    Reaching this usually means one of two things. Either the agent grew a
+    trigger, tool, rule, or action that was never registered, which is a
+    one-line fix in this module, or free text reached a field that is meant
+    to carry an identifier, which is the failure the vocabularies exist to
+    catch.
     """
 
 
@@ -170,6 +291,24 @@ def _normalize_text(name: str, value: Any) -> str:
         raise InvalidFieldError(
             f"field {name!r} is {len(normalized)} characters after "
             f"normalization, over the {_MAX_VALUE_LENGTH} character limit."
+        )
+    # Membership last, so the shape complaints stay specific. Normalization
+    # runs first, which is what lets a caller pass ISSUE_REFUND for the
+    # registered issue_refund. It does not let a caller pass a phrase.
+    vocabulary = FIELD_SPEC[name].vocabulary
+    if normalized not in vocabulary:
+        # The offending value is echoed truncated because this is the path a
+        # leaked phrase arrives on and the developer needs to see what
+        # leaked. The registered values are module constants, never stored or
+        # user data, so listing them is safe.
+        shown = normalized[:_MAX_ECHO_LENGTH]
+        if len(normalized) > _MAX_ECHO_LENGTH:
+            shown += "..."
+        raise UnregisteredValueError(
+            f"field {name!r} got {shown!r}, which is not in its vocabulary. "
+            f"Registered values: {', '.join(sorted(vocabulary))}. Register a "
+            "new one in signature.py, or fix the caller if free text reached "
+            "a field that carries an identifier."
         )
     return normalized
 
