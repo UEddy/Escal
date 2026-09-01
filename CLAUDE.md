@@ -145,10 +145,18 @@ an error to suppress.
 The pattern key is deterministic and derived from the agent's own structured
 internal state, never from user-supplied text.
 
-Inputs are things like: which policy rule could not be resolved, which tool
-returned an ambiguous result, which confidence threshold was missed, what
-action was pending. Two escalations phrased differently by two customers
-produce the same signature when the agent stalled for the same reason.
+Inputs are things like: why the agent stalled, which policy rule could not be
+resolved, which tool returned an ambiguous result, what action was pending.
+Two escalations phrased differently by two customers produce the same
+signature when the agent stalled for the same reason.
+
+Membership rule: a field belongs in the signature if it describes the
+situation, not if it describes the configuration. Tunable config is not a
+property of the situation, and anything retunable that is keyed on forks every
+stored pattern on the next tune and orphans its accumulated counters. The
+confidence threshold is the case in point, and is deliberately absent: it
+lives in HOT state, and the value in force at the time is recorded on the
+journal event, where it stays auditable without entering the key.
 
 Rationale:
 - Determinism is required for confidence accumulation. A regenerated signature
@@ -171,6 +179,11 @@ pass when the exact key misses. Lookup order: exact key, then
   decision audit log.
 - HOT state: current confidence threshold, pending escalation.
 - REFERENCE: the escalation policy document.
+
+Validate the confidence threshold with `validate_confidence_threshold` from
+`src/signature.py` wherever it is stored or read back, on the HOT state write
+path and on the journal event. It enforces the 0.0 to 1.0 range and rejects
+bools and NaN. It is not a signature input, see the membership rule above.
 
 ## Deletion test
 
