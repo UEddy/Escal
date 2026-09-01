@@ -35,13 +35,20 @@ __all__ = [
     "InvalidFieldError",
     "escalation_signature",
     "canonical_form",
+    "validate_confidence_threshold",
 ]
 
 # Bump when the field set or the normalization rules change. The version is
 # part of the hashed payload and of the emitted key, so a schema change shows
 # up in the store as a new pattern rather than as a silent counter reset on an
 # existing one.
-SIGNATURE_VERSION = "v1"
+#
+# v1: trigger, policy_rule, tool, pending_action, confidence_threshold.
+# v2: confidence_threshold removed. It is tunable agent config held in HOT
+#     state, not a property of the situation, so keying on it forked every
+#     stored pattern the moment the threshold was retuned and orphaned the
+#     counters. Patterns written under v1 are not readable under v2 by design.
+SIGNATURE_VERSION = "v2"
 
 # Length of the truncated digest carried in the key. 16 hex characters is 64
 # bits, far beyond the collision headroom needed for the number of distinct
@@ -57,17 +64,11 @@ _MAX_VALUE_LENGTH = 256
 # only. The digest is what identifies the pattern.
 _MAX_SLUG_LENGTH = 48
 
-# Fixed decimal places for numeric fields. Without quantization a threshold
-# arriving as 0.8500000000000001 on one run and 0.85 on the next would produce
-# two different keys for one pattern.
-_NUMERIC_PRECISION = 4
-
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 
 
 class _Field(NamedTuple):
-    kind: str  # "text" or "unit_interval"
     nullable: bool
     doc: str
 
@@ -76,31 +77,30 @@ class _Field(NamedTuple):
 # not apply to a given escalation is passed explicitly as None, which encodes
 # distinctly from any value: the caller states the absence rather than omitting
 # the key, so a dropped field can never masquerade as a not-applicable one.
+#
+# The test for membership is whether the field describes the situation the
+# agent stalled in, not how the agent was configured when it stalled. Tunable
+# config belongs in HOT state. Anything retunable that is keyed on here forks
+# every stored pattern on the next tune and orphans its counters, which is why
+# the confidence threshold is deliberately absent. Do not add it back. See
+# validate_confidence_threshold for its validation, which lives on where the
+# threshold is actually stored.
 FIELD_SPEC: Mapping[str, _Field] = {
     "trigger": _Field(
-        kind="text",
         nullable=False,
         doc="Why the agent stalled, as an agent-internal trigger identifier.",
     ),
     "policy_rule": _Field(
-        kind="text",
         nullable=True,
         doc="Identifier of the policy rule that could not be resolved.",
     ),
     "tool": _Field(
-        kind="text",
         nullable=True,
         doc="Name of the tool that returned an ambiguous or unusable result.",
     ),
     "pending_action": _Field(
-        kind="text",
         nullable=True,
         doc="The action the agent was about to take when it stalled.",
-    ),
-    "confidence_threshold": _Field(
-        kind="unit_interval",
-        nullable=True,
-        doc="The confidence threshold that was missed, from 0.0 to 1.0.",
     ),
 }
 
@@ -120,7 +120,11 @@ class UnknownFieldError(SignatureError):
 
 
 class InvalidFieldError(SignatureError):
-    """A field was supplied with a value the schema cannot normalize."""
+    """A field was supplied with a value that cannot be normalized.
+
+    Also raised by validate_confidence_threshold, which is not a signature
+    input but shares the error type so callers have one thing to catch.
+    """
 
 
 def _check_keys(fields: Mapping[str, Any]) -> None:
@@ -170,20 +174,32 @@ def _normalize_text(name: str, value: Any) -> str:
     return normalized
 
 
-def _normalize_unit_interval(name: str, value: Any) -> str:
-    # bool is a subclass of int. True would quantize to 1.0000 and read as a
-    # threshold of 1.0, so reject it outright.
+def validate_confidence_threshold(
+    value: Any, *, field_name: str = "confidence_threshold"
+) -> float:
+    """Validate a confidence threshold and return it as a float.
+
+    The threshold is tunable agent config, so it is not a signature input: it
+    describes how the agent was configured, not the situation it stalled in.
+    This validator lives here because the rule it enforces was written here,
+    and belongs on the HOT state write path where the threshold is actually
+    stored. Raises InvalidFieldError on anything outside 0.0 to 1.0.
+    """
+    # bool is a subclass of int. True would read as a threshold of 1.0, which
+    # disables escalation entirely, so reject it outright.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidFieldError(
-            f"field {name!r} must be a real number, got {type(value).__name__}."
+            f"field {field_name!r} must be a real number, got "
+            f"{type(value).__name__}."
         )
     numeric = float(value)
+    # Also rejects NaN, which fails every comparison.
     if not 0.0 <= numeric <= 1.0:
         raise InvalidFieldError(
-            f"field {name!r} must be in the range 0.0 to 1.0, got {value!r}. "
-            "Confidence is a fraction, not a percentage."
+            f"field {field_name!r} must be in the range 0.0 to 1.0, got "
+            f"{value!r}. Confidence is a fraction, not a percentage."
         )
-    return f"{numeric:.{_NUMERIC_PRECISION}f}"
+    return numeric
 
 
 def _normalize_field(name: str, value: Any) -> str:
@@ -197,9 +213,7 @@ def _normalize_field(name: str, value: Any) -> str:
         # A normalized value is never empty, so "" is an unambiguous marker for
         # a field the caller declared inapplicable.
         return ""
-    if spec.kind == "text":
-        return _normalize_text(name, value)
-    return _normalize_unit_interval(name, value)
+    return _normalize_text(name, value)
 
 
 def canonical_form(fields: Mapping[str, Any]) -> str:
@@ -239,8 +253,8 @@ def escalation_signature(fields: Mapping[str, Any]) -> str:
 
     Takes the agent's structured escalation state as a mapping over exactly
     the keys in FIELD_SPEC and returns a key of the form
-    esc.v1.<trigger-slug>.<digest>, safe to use directly as a Sibyl entity
-    name.
+    esc.<version>.<trigger-slug>.<digest>, safe to use directly as a Sibyl
+    entity name.
 
     Raises MissingFieldError if a schema field is absent, UnknownFieldError if
     a key outside the schema is present, and InvalidFieldError if a value

@@ -31,6 +31,7 @@ from signature import (
     UnknownFieldError,
     canonical_form,
     escalation_signature,
+    validate_confidence_threshold,
 )
 
 # A fully populated escalation: every field carries a value.
@@ -39,7 +40,6 @@ FULL = {
     "policy_rule": "refund.over_limit",
     "tool": "billing_lookup",
     "pending_action": "issue_refund",
-    "confidence_threshold": 0.85,
 }
 
 # A realistic sparse escalation: no tool was involved.
@@ -48,7 +48,6 @@ SPARSE = {
     "policy_rule": None,
     "tool": None,
     "pending_action": "close_ticket",
-    "confidence_threshold": 0.6,
 }
 
 
@@ -83,7 +82,6 @@ def test_signature_is_stable_across_processes_and_hash_seeds():
             "policy_rule": "refund.over_limit",
             "tool": "billing_lookup",
             "pending_action": "issue_refund",
-            "confidence_threshold": 0.85,
         }))
         """
     )
@@ -108,21 +106,7 @@ def test_golden_value():
     to be bumped deliberately, not that the constant should be edited."""
     assert (
         escalation_signature(FULL)
-        == "esc.v1.policy-rule-unresolved.844c0131039b0a41"
-    )
-
-
-def test_float_representation_noise_does_not_change_the_key():
-    noisy = 0.1 + 0.2 + 0.55  # 0.8500000000000001, not 0.85
-    assert noisy != 0.85
-    assert escalation_signature(variant(confidence_threshold=noisy)) == (
-        escalation_signature(variant(confidence_threshold=0.85))
-    )
-
-
-def test_int_and_float_thresholds_agree():
-    assert escalation_signature(variant(confidence_threshold=1)) == (
-        escalation_signature(variant(confidence_threshold=1.0))
+        == "esc.v2.policy-rule-unresolved.9ae9cdb8e397597c"
     )
 
 
@@ -191,7 +175,6 @@ def test_canonical_form_is_sorted_regardless_of_input_order():
         {"policy_rule": "refund.under_limit"},
         {"tool": "crm_lookup"},
         {"pending_action": "escalate_to_billing"},
-        {"confidence_threshold": 0.86},
     ],
 )
 def test_changing_any_field_changes_the_key(overrides):
@@ -257,6 +240,31 @@ def test_unknown_field_raises_rather_than_being_ignored():
         escalation_signature(variant(customer_message="I want a refund now"))
 
 
+def test_confidence_threshold_is_not_a_signature_field():
+    """Regression guard for the v2 schema change. The threshold is tunable
+    agent config held in HOT state, not a property of the situation. Keying on
+    it forks every stored pattern on the next tune and orphans its counters,
+    so passing it must fail loudly rather than quietly changing keys."""
+    assert "confidence_threshold" not in FIELD_SPEC
+    with pytest.raises(UnknownFieldError, match="confidence_threshold"):
+        escalation_signature(variant(confidence_threshold=0.85))
+
+
+def test_schema_is_pinned():
+    """Every field here has to describe the situation the agent stalled in,
+    not how the agent was configured when it stalled. Adding a field orphans
+    every stored pattern, so this breaking is the point: it should break in a
+    commit that also bumps SIGNATURE_VERSION."""
+    assert REQUIRED_FIELDS == {
+        "trigger",
+        "policy_rule",
+        "tool",
+        "pending_action",
+    }
+    assert set(FULL) == REQUIRED_FIELDS
+    assert set(SPARSE) == REQUIRED_FIELDS
+
+
 def test_near_miss_field_name_raises():
     """The failure mode this guards: a typo silently drops a real field and
     the caller gets a valid-looking key for the wrong pattern."""
@@ -299,24 +307,6 @@ def test_overlong_text_raises():
         escalation_signature(variant(policy_rule="r" * 257))
 
 
-@pytest.mark.parametrize("bad", ["0.85", [], object()])
-def test_non_numeric_threshold_raises(bad):
-    with pytest.raises(InvalidFieldError, match="confidence_threshold"):
-        escalation_signature(variant(confidence_threshold=bad))
-
-
-def test_bool_threshold_raises():
-    """True would quantize to 1.0000 and read as a threshold of 1.0."""
-    with pytest.raises(InvalidFieldError, match="confidence_threshold"):
-        escalation_signature(variant(confidence_threshold=True))
-
-
-@pytest.mark.parametrize("bad", [85, -0.1, 1.0001, float("nan"), float("inf")])
-def test_threshold_outside_the_unit_interval_raises(bad):
-    with pytest.raises(InvalidFieldError, match="0.0 to 1.0"):
-        escalation_signature(variant(confidence_threshold=bad))
-
-
 @pytest.mark.parametrize("bad", [None, [], "trigger", 7, ("trigger", "x")])
 def test_non_mapping_input_raises(bad):
     with pytest.raises(InvalidFieldError, match="mapping"):
@@ -327,6 +317,57 @@ def test_every_error_is_a_signature_error():
     for bad in ({}, variant(extra=1), variant(trigger=None)):
         with pytest.raises(SignatureError):
             escalation_signature(bad)
+
+
+# ---------------------------------------------------------------------------
+# The confidence threshold validator, which is not a signature input
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [0.0, 0.5, 0.85, 1.0, 0, 1])
+def test_validator_accepts_the_unit_interval_and_returns_a_float(value):
+    result = validate_confidence_threshold(value)
+    assert result == float(value)
+    assert isinstance(result, float)
+
+
+@pytest.mark.parametrize("bad", [85, 100, -0.1, 1.0001, float("inf"), float("-inf")])
+def test_validator_rejects_values_outside_the_unit_interval(bad):
+    with pytest.raises(InvalidFieldError, match="0.0 to 1.0"):
+        validate_confidence_threshold(bad)
+
+
+def test_validator_rejects_nan():
+    """NaN fails every comparison, so it would slip through a naive range
+    check and then compare false against any confidence forever."""
+    with pytest.raises(InvalidFieldError, match="0.0 to 1.0"):
+        validate_confidence_threshold(float("nan"))
+
+
+@pytest.mark.parametrize("bad", ["0.85", None, [], {}, object()])
+def test_validator_rejects_non_numbers(bad):
+    with pytest.raises(InvalidFieldError, match="real number"):
+        validate_confidence_threshold(bad)
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_validator_rejects_bools(bad):
+    """bool is a subclass of int. True would read as a threshold of 1.0,
+    which disables escalation entirely."""
+    with pytest.raises(InvalidFieldError, match="real number"):
+        validate_confidence_threshold(bad)
+
+
+def test_validator_reports_the_caller_supplied_field_name():
+    with pytest.raises(InvalidFieldError, match="auto_handle_floor"):
+        validate_confidence_threshold(2.0, field_name="auto_handle_floor")
+
+
+def test_validator_error_is_a_signature_error_and_a_value_error():
+    with pytest.raises(SignatureError):
+        validate_confidence_threshold(2.0)
+    with pytest.raises(ValueError):
+        validate_confidence_threshold(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +391,12 @@ def test_key_shape_is_a_valid_sibyl_entity_name(fields):
 )
 def test_key_stays_ascii_and_slug_shaped_whatever_the_trigger(trigger):
     key = escalation_signature(variant(trigger=trigger))
-    assert re.fullmatch(r"esc\.v1\.[a-z0-9-]+\.[0-9a-f]{16}", key), key
+    pattern = rf"esc\.{re.escape(SIGNATURE_VERSION)}\.[a-z0-9-]+\.[0-9a-f]{{16}}"
+    assert re.fullmatch(pattern, key), key
 
 
 def test_sparse_escalation_produces_a_usable_key():
     assert re.fullmatch(
-        r"esc\.v1\.confidence-below-threshold\.[0-9a-f]{16}",
+        rf"esc\.{re.escape(SIGNATURE_VERSION)}\.confidence-below-threshold\.[0-9a-f]{{16}}",
         escalation_signature(SPARSE),
     )
