@@ -26,7 +26,7 @@ untouched.
 TENANCY
 =======
 Dev, test, and spike data never mix. Tests use TEST_TENANT and clean up after
-themselves. See CLAUDE.md: the SDK default tenant is a UUID, the CLI derives
+themselves. See DESIGN.md: the SDK default tenant is a UUID, the CLI derives
 its own from the account, and this project passes its tenant explicitly every
 time.
 """
@@ -122,7 +122,7 @@ class PatternRecall:
     whether a given one means "could not tell" or "not present" is what
     `match_failed` records. For ABSTAINED_ON that depends on the blocking
     token, so the two are not interchangeable. See the verdict table in
-    CLAUDE.md.
+    DESIGN.md.
     """
 
     signature: str
@@ -341,7 +341,7 @@ def _classify_match_failure(verdict) -> bool:
 def recall_pattern(client: MemoryClient, fields: dict[str, Any]) -> PatternRecall:
     """Recall the pattern for one escalation.
 
-    Lookup order per CLAUDE.md: exact key first, then the fuzzy second pass,
+    Lookup order per DESIGN.md: exact key first, then the fuzzy second pass,
     then branch on the verdict.
 
     The exact hit is the common case and costs one indexed read. The fuzzy

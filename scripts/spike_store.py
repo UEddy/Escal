@@ -2,7 +2,7 @@
 reachable, and checks FTS5 behaviour on the digest-bearing signature format.
 
 NOT part of the system. Nothing here is imported by src/. Delete after the
-findings land in CLAUDE.md.
+findings land in DESIGN.md.
 
 Run:
     $env:PYTHONIOENCODING="utf-8"

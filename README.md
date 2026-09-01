@@ -223,7 +223,7 @@ an empty directory.
                            package. The PyPI README is stale; this is the
                            source of truth every design decision was checked
                            against.
-    CLAUDE.md              Design decisions and the verified Sibyl API surface.
+    DESIGN.md              Design decisions and the verified Sibyl API surface.
     requirements.txt       Runtime dependency, pinned.
     requirements-dev.txt   Adds pytest, for running the suite.
     requirements-lock.txt  Full transitive record of the dev environment.
