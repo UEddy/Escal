@@ -296,8 +296,106 @@ Validate the confidence threshold with `validate_confidence_threshold` from
 path and on the journal event. It enforces the 0.0 to 1.0 range and rejects
 bools and NaN. It is not a signature input, see the membership rule above.
 
+## The agent
+
+`src/agent.py` is the producer of signature fields: a refund handler scoped to
+the demo scenario. It evaluates a request against the policy document and, when
+it stalls, reads the four fields out of the branch that gave up. No model call,
+no customer text. `evaluate_policy` returns either a resolution string or a
+`StallState`, and `StallState.signature_fields()` is the only input to
+`escalation_signature`.
+
+### The pattern counters count human decisions, not encounters
+
+`times_seen` is the number of times a human was asked about this pattern, not
+the number of times the situation occurred. `record_outcome` is therefore
+called only when a human actually decided, never on an auto-handled request.
+
+This is load-bearing, not bookkeeping. `times_seen` is the denominator of an
+agreement rate. An auto-handled encounter has no human decision to pair with
+an increment, so incrementing on it would raise the denominator while the
+numerator stood still:
+
+    (agreed + 1) / (seen + 2)
+
+Confidence would fall every time the agent used what it had learned. A settled
+pattern would decay back below the threshold, start escalating again, climb
+back, and oscillate forever. Do not "fix" the counters to track encounters.
+
+Encounters are counted in the journal, which records every escalation
+instance, auto-handled ones included. If you need occurrence counts, read the
+journal. The entity holds the agreement rate.
+
+### Other agent decisions worth knowing
+
+- **A cold-start decision seeds as agreement.** With nothing recalled there is
+  nothing to disagree with, so the first human decision establishes the
+  pattern with `human_agreed=True` rather than counting as an override.
+  Otherwise every new pattern would seed at 0.2 confidence and effectively
+  never recover. Agreement on later decisions means the human landed on the
+  stored resolution.
+- **Resolved requests are not journalled.** When the policy closes a request
+  without stalling, no pattern is involved and no event is written. The
+  journal is a decision audit log, not a request log. Journalling the resolved
+  path would spend the cap on events with nothing to audit. Reverse this if
+  the audit requirement changes to a complete request log, and re-measure
+  against the cap first: the journal is the unbounded growth risk.
+- **`tool_unavailable` takes precedence** over a rule's own trigger, because
+  the agent could not evaluate the rule at all.
+- **More than one matching rule is `conflicting_policy_rules`**, with the
+  sorted-first rule id as `policy_rule`. `_matching_rule_ids` sorts before
+  use, so reordering the condition checks cannot fork every stored pattern.
+- `check_policy_consistency` reads the STORED policy out of REFERENCE, not the
+  module constant. That is the point: the constant and `POLICY_RULES` can
+  agree perfectly while the store holds a stale document from an older deploy,
+  and the stored copy is what a human reviewing an escalation consults. It
+  raises on drift in either direction, at startup rather than mid-request.
+- `get_reference` returns the body as a raw STRING. It does not deserialize
+  the way entity and state bodies do, even though `set_reference` accepts a
+  dict and coerces it to JSON. The parse is the caller's.
+
 ## Deletion test
 
 Removing the Sibyl layer must break the core function. With no patterns there
 is no calibration, so the system escalates every time. Keep this true. Any
 convenience cache that preserves behaviour without Sibyl fails the gate.
+
+## Running the demo
+
+`scripts/demo.py` is the scripted run behind the video. Three modes, each a
+SEPARATE process invocation. That is deliberate: the claim being demonstrated
+is that the only thing crossing the process boundary is Sibyl, and one
+function call could not show it.
+
+    $env:PYTHONIOENCODING="utf-8"
+    .venv/Scripts/python.exe scripts/demo.py phase1
+    .venv/Scripts/python.exe scripts/demo.py phase2
+    .venv/Scripts/python.exe scripts/demo.py no-memory
+
+| Mode | What it does |
+| --- | --- |
+| `phase1` | Fresh store. Publishes the policy, sets the threshold, runs three identical stalls with a scripted human agreeing. Confidence climbs 0.6667, 0.7500, 0.8000. Exits. |
+| `phase2` | New process, same store. A fourth identical request auto-handles from memory with no human. |
+| `no-memory` | The same fourth request against a tenant with no history. It escalates. The deletion test on screen. |
+
+**`phase1` must run before `phase2`.** Phase 2 reads what phase 1 wrote; with
+no store it exits non-zero and says so.
+
+**`phase1` destroys and recreates its store without confirmation.** That is
+what makes every take start from a true cold start, but a re-run mid-session
+discards the state an earlier take recorded. It only ever touches the demo
+store, never the dev or test tenants.
+
+The threshold of 0.8 and the three-agreement ladder are not arbitrary:
+`derive_confidence(3, 3)` is exactly 0.8, so the fourth request is the first
+that can auto-handle. Changing `CONFIDENCE_PRIOR_WEIGHT` or the threshold
+changes how many escalations the demo needs before it converges.
+
+Set `ESCALATION_DEMO_DB` to point the demo at a different store. The smoke
+test in `tests/test_demo.py` uses it to run all three modes under `tmp_path`
+so it cannot clobber a take in progress. That test drives the script as three
+subprocesses and pins the numbers the video depends on, so run the suite
+before recording.
+
+Demo data uses tenant `escalation-memory-demo` (and
+`escalation-memory-demo-empty` for `no-memory`), separate from dev and test.
