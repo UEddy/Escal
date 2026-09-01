@@ -7,6 +7,10 @@ auto-handle, or route differently.
 
 Built for the Sibyl Labs Hackathon. Build window Sep 1 to 10, 2026.
 
+This is the governing design document for the project. It holds the hard
+rules, the verified Sibyl API surface, and the reasoning behind every design
+decision. New guidance belongs here.
+
 ## Hard rules
 
 - **Memory is load-bearing.** Never write a fallback path that works without
