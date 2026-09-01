@@ -1,2 +1,4 @@
 ﻿.venv/
 docs/api-actual.txt.bak
+__pycache__/
+*.pyc
