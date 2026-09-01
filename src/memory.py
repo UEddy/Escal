@@ -465,6 +465,14 @@ def record_outcome(
 ) -> dict[str, Any]:
     """Create or update the pattern entity after a human has decided.
 
+    COUNTS HUMAN DECISIONS, NOT ENCOUNTERS. Call this only when a human
+    actually decided. times_seen is the denominator of an agreement rate, so
+    an auto-handled encounter must not increment it: there would be no
+    agreement to pair with the increment, confidence would fall every time
+    the agent used what it had learned, and a settled pattern would decay
+    back below the threshold and start escalating again. The journal is where
+    every encounter is counted, auto-handled ones included.
+
     `raw_context` is the free customer text. It goes in the body, never in the
     key, and it is what FTS5 serves on the fuzzy pass. Passing it is optional
     but recommended: without it the second pass has only vocabulary terms to
