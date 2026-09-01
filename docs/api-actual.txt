@@ -1,0 +1,1199 @@
+class MemoryClient:
+    """Single canonical interface for reading and writing Sibyl Memory state."""
+
+    # Paid-tier-only features. Free tier raises TierGateError; upgrading to any
+    # paid tier unlocks both self-learning and the memory linter.
+    _PAID_ONLY_TIERS = frozenset({"sync", "team", "lifetime", "stake", "enterprise"})
+
+    def __init__(
+        self,
+        storage: Storage,
+        *,
+        tenant_id: str = DEFAULT_TENANT,
+        tier: str = "free",
+        account_id: str | None = None,
+        session_token: str | None = None,
+        cap_gate: Any = None,
+        credentials_claim: dict[str, Any] | None = None,
+        credentials_signature: str | None = None,
+    ) -> None:
+        self._storage = storage
+        # CORE-8: validate the tenant_id at construction too (set_tenant guards
+        # the runtime switch; this guards the initial value). Re-raise as
+        # TenantError for a consistent failure mode.
+        try:
+            validate_identifier(tenant_id, field_name="tenant_id")
+        except ValidationError as e:
+            raise TenantError(str(e), recovery=e.recovery) from e
+        self._tenant_id = tenant_id
+        self._tier = tier
+        self._account_id = account_id
+        self._session_token = session_token
+
+        # Cap gate: enforces the 5 MB free-tier cap with server-authoritative
+        # tier verification at the boundary. See _capcheck.py for the design.
+        if cap_gate is None:
+            from ._capcheck import CapGate, TierCache, aggregate_db_size
+            cap_gate = CapGate(
+                account_id=account_id,
+                session_token=session_token,
+                # ACCOUNT-level cap (0.4.18): the FREE-tier cap is per account,
+                # not per DB file, so the gate sizes EVERY memory store this
+                # machine resolves (SDK default ~/.sibyl-memory, Hermes adapter
+                # + per-profile stores, SIBYL_MEMORY_DB override, and the active
+                # db_path), deduped by resolved path. Each store is still sized
+                # WAL-inclusively via db_size_bytes (CAP-1: sizing memory.db
+                # alone under-counts writes still sitting in memory.db-wal
+                # during a burst), so this composes with CAP-1 rather than
+                # regressing it.
+                db_size_fn=lambda: aggregate_db_size(storage.db_path),
+                local_tier_hint=tier,
+                cache=TierCache(
+                    Path(storage.db_path).parent / "tier_cache.json"
+                ),
+                credentials_claim=credentials_claim,
+                credentials_signature=credentials_signature,
+            )
+        self._cap_gate = cap_gate
+
+        # Usage heartbeat: local-first memory ops never hit the network, so the
+        # server has no usage signal. This reports ONLY aggregate op COUNTS
+        # (no content, no PII beyond account_id), debounced + fire-and-forget,
+        # so an active account's request count finally reflects real use.
+        # No-op without an account_id; opt out with SIBYL_MEMORY_TELEMETRY=0.
+        try:
+            from ._heartbeat import HeartbeatReporter
+            self._heartbeat = HeartbeatReporter(account_id, session_token)
+        except Exception:
+            from ._heartbeat import _NullHeartbeat
+            self._heartbeat = _NullHeartbeat()
+
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
+    @classmethod
+    def local(
+        cls,
+        path: str | Path = "~/.sibyl-memory/memory.db",
+        *,
+        tenant_id: str = DEFAULT_TENANT,
+        tier: str = "free",
+        account_id: str | None = None,
+        session_token: str | None = None,
+        credentials_claim: dict[str, Any] | None = None,
+        credentials_signature: str | None = None,
+    ) -> "MemoryClient":
+        """Open a local SQLite-backed MemoryClient.
+
+        The directory at ``path``'s parent is created with mode 0700 if
+        missing. The schema is applied on first open and is idempotent.
+
+        Set ``tier`` to the user's plugin tier so paid-only features
+        (self-learning + memory linter) gate correctly. Defaults to "free".
+
+        Pass ``account_id`` and ``session_token`` from credentials.json so
+        the SDK can verify the user's tier against the server when they
+        approach the 5 MB free-tier cap. Without these, the SDK enforces
+        a strict local 5 MB cap (no server check possible).
+        """
+        storage = Storage(path)
+        return cls(
+            storage,
+            tenant_id=tenant_id,
+            tier=tier,
+            account_id=account_id,
+            session_token=session_token,
+            credentials_claim=credentials_claim,
+            credentials_signature=credentials_signature,
+        )
+
+    # ------------------------------------------------------------------
+    # Tenant management
+    # ------------------------------------------------------------------
+    def get_tenant(self) -> str:
+        return self._tenant_id
+
+    def set_tenant(self, tenant_id: str) -> None:
+        """Switch the active tenant.
+
+        CORE-8 (2026-06-25 pre-launch audit): tenant_id is now validated the
+        same way every other user-supplied identifier is (non-empty string, no
+        control characters / null bytes, no path-traversal or shell
+        metacharacters, length <= 1024). An unvalidated tenant_id silently
+        created a separate, unreachable data partition (a control char or empty
+        string is a different key than the user thinks they typed), which both
+        loses data and weakens isolation. validate_identifier raises
+        ValidationError; we re-raise as TenantError to keep the documented
+        set_tenant failure mode.
+        """
+        try:
+            validate_identifier(tenant_id, field_name="tenant_id")
+        except ValidationError as e:
+            raise TenantError(str(e), recovery=e.recovery) from e
+        self._tenant_id = tenant_id
+
+    @property
+    def storage(self) -> Storage:
+        return self._storage
+
+    def schema_version(self) -> int | None:
+        return self._storage.schema_version()
+
+    # ------------------------------------------------------------------
+    # Tier (paid-tier-only feature gating)
+    # ------------------------------------------------------------------
+    def get_tier(self) -> str:
+        return self._tier
+
+    def set_tier(self, tier: str) -> None:
+        """Update the user's tier. Called by the credentials loader when
+        the activation flow returns a tier upgrade."""
+        if not isinstance(tier, str) or not tier:
+            raise ValidationError("tier must be a non-empty string")
+        self._tier = tier
+
+    def _effective_tier(self) -> str:
+        """Best-available trustworthy tier for feature gating.
+
+        CORE-10 (2026-06-25 pre-launch audit, SAFE-MINIMAL — see FLAG below):
+        the paid-feature gates trusted the raw client-supplied ``self._tier``,
+        so editing credentials.json to ``tier:"lifetime"`` unlocked the learner
+        and linter for free. A full server round-trip on every learn()/lint()
+        would be the authoritative fix but risks latency + offline regressions,
+        so we use the cheapest server-authoritative signal we already hold: the
+        CapGate's tier cache, which is populated by a server-verified
+        /check-write boundary call.
+
+        When the cache carries a FRESH, account-matched entry, its tier is the
+        server's word and overrides the client hint — a tampered free->paid
+        credentials edit is caught the moment a real cache exists. When there is
+        no usable cache (user never approached the cap, or offline pre-cache),
+        we fall back to the client hint (unchanged behavior, no new failure
+        mode). This narrows the abuse window without a network dependency.
+        """
+        gate = getattr(self, "_cap_gate", None)
+        cache = getattr(gate, "_cache", None)
+        account_id = getattr(gate, "account_id", None)
+        if cache is not None:
+            try:
+                cached = cache.load()
+            except Exception:
+                cached = None
+            if (cached is not None and cached.is_fresh
+                    and cached.account_id == account_id
+                    and account_id is not None):
+                return cached.tier
+        return self._tier
+
+    def _require_paid_tier(self, feature: str) -> None:
+        """Raise TierGateError if the current tier is not paid-tier.
+
+        CORE-10: gates on the server-authoritative tier when a fresh cap-gate
+        cache is available, else on the client hint (see _effective_tier).
+        """
+        from .exceptions import TierGateError
+        effective = self._effective_tier()
+        if effective not in self._PAID_ONLY_TIERS:
+            raise TierGateError(
+                f"{feature} requires a paid tier. Current tier: {effective!r}.",
+                feature=feature,
+                current_tier=effective,
+            )
+
+    # ------------------------------------------------------------------
+    # Entities (WARM tier): single source of truth per rule 43
+    # ------------------------------------------------------------------
+    @_track_op("set_entity")
+    def set_entity(
+        self,
+        category: str,
+        name: str,
+        body: dict[str, Any] | list[Any],
+        *,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert or update an entity.
+
+        UNIQUE (tenant_id, category, name) is enforced at the DB level. On
+        conflict the existing row is updated (body + status + updated_at).
+        Returns the resulting entity row as a dict.
+
+        Subject to the 5 MB free-tier cap when tier='free'. Raises
+        CapExceededError if the write would push the local DB past the cap
+        and the server-authoritative tier check confirms the account is
+        still free.
+
+        v0.4.0: category and name are validated as identifiers (non-empty
+        string, no control characters, length <= 1024). Raises
+        ValidationError on rejection."""
+        validate_identifier(category, field_name="category")
+        validate_identifier(name, field_name="name")
+        _require_container(body)
+        body_json = _check_json(body)
+        # Cap gate: rough byte estimate (FTS5 + indexes add overhead)
+        self._cap_gate.check(proposed_delta_bytes=len(body_json) + len(name) + len(category) + 200)
+        with self._storage.transaction() as conn:
+            existing = conn.execute(
+                "SELECT id FROM entities WHERE tenant_id = ? AND category = ? AND name = ?",
+                (self._tenant_id, category, name),
+            ).fetchone()
+            if existing is None:
+                ent_id = new_id()
+                conn.execute(
+                    "INSERT INTO entities (id, tenant_id, category, name, status, body) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (ent_id, self._tenant_id, category, name, status, body_json),
+                )
+            else:
+                ent_id = existing["id"]
+                conn.execute(
+                    "UPDATE entities SET status = ?, body = ?, "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+                    "WHERE id = ?",
+                    (status, body_json, ent_id),
+                )
+            # CAP-2: absolute-footprint recheck inside the same transaction.
+            self._verify_committed_size(conn)
+        return self.get_entity(category, name)
+
+    @_track_op("recall")
+    def get_entity(self, category: str, name: str) -> dict[str, Any]:
+        with self._storage.connection() as conn:
+            row = conn.execute(
+                "SELECT id, tenant_id, category, name, status, body, created_at, updated_at "
+                "FROM entities WHERE tenant_id = ? AND category = ? AND name = ?",
+                (self._tenant_id, category, name),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"entity {category}/{name} not found for tenant {self._tenant_id}")
+        return self._row_to_entity(row)
+
+    @_track_op("list_entities")
+    def list_entities(
+        self,
+        category: str | None = None,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        limit = _clamp_limit(limit)  # CORE-5: negative/huge limit must not broaden
+        sql = "SELECT id, tenant_id, category, name, status, body, created_at, updated_at FROM entities WHERE tenant_id = ?"
+        params: list[Any] = [self._tenant_id]
+        if category is not None:
+            sql += " AND category = ?"
+            params.append(category)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._storage.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_entity(r) for r in rows]
+
+    def delete_entity(self, category: str, name: str) -> bool:
+        with self._storage.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM entities WHERE tenant_id = ? AND category = ? AND name = ?",
+                (self._tenant_id, category, name),
+            )
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # State documents (HOT tier)
+    # ------------------------------------------------------------------
+    @_track_op("set_state")
+    def set_state(self, key: str, body: dict[str, Any] | list[Any]) -> None:
+        """Insert or update a HOT-tier state document.
+
+        v0.4.0: ``key`` is validated as an identifier (non-empty string, no
+        control characters, length <= 1024). Raises ValidationError on
+        rejection."""
+        validate_identifier(key, field_name="key")
+        _require_container(body)
+        body_json = _check_json(body)
+        self._cap_gate.check(proposed_delta_bytes=len(body_json) + len(key) + 150)
+        with self._storage.transaction() as conn:
+            conn.execute(
+                "INSERT INTO state_documents (tenant_id, document_key, body) VALUES (?, ?, ?) "
+                "ON CONFLICT(tenant_id, document_key) DO UPDATE SET body = excluded.body, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                (self._tenant_id, key, body_json),
+            )
+            # CAP-2: absolute-footprint recheck inside the same transaction.
+            self._verify_committed_size(conn)
+
+    def get_state(self, key: str) -> dict[str, Any] | None:
+        with self._storage.connection() as conn:
+            row = conn.execute(
+                "SELECT body, updated_at FROM state_documents WHERE tenant_id = ? AND document_key = ?",
+                (self._tenant_id, key),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"body": loads(row["body"]), "updated_at": row["updated_at"]}
+
+    # ------------------------------------------------------------------
+    # Journal (COLD tier): append-only event log
+    # ------------------------------------------------------------------
+    def write_event(
+        self,
+        *,
+        evaluated: Any = None,
+        acted: Any = None,
+        forward: Any = None,
+        extra: Any = None,
+        ts: str | None = None,
+    ) -> str:
+        # Estimate byte cost from each non-None payload
+        delta = 200  # row + index overhead
+        for payload in (evaluated, acted, forward, extra):
+            if payload is not None:
+                try:
+                    delta += len(dumps(payload))
+                except (TypeError, ValueError):
+                    delta += 100  # estimate; the JSON check below will catch real failures
+        self._cap_gate.check(proposed_delta_bytes=delta)
+        ev_id = new_id()
+        with self._storage.transaction() as conn:
+            conn.execute(
+                "INSERT INTO journal_events (id, tenant_id, ts, evaluated, acted, forward, extra) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ev_id,
+                    self._tenant_id,
+                    ts or _utc_now_iso(),
+                    _check_json(evaluated, "evaluated") if evaluated is not None else None,
+                    _check_json(acted, "acted") if acted is not None else None,
+                    _check_json(forward, "forward") if forward is not None else None,
+                    _check_json(extra, "extra") if extra is not None else None,
+                ),
+            )
+            # CAP-2: absolute-footprint recheck inside the same transaction.
+            self._verify_committed_size(conn)
+        return ev_id
+
+    def read_events(
+        self,
+        *,
+        limit: int = 50,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = _clamp_limit(limit)  # CORE-5: negative limit = SQLite unbounded; clamp
+        sql = "SELECT id, tenant_id, ts, evaluated, acted, forward, extra FROM journal_events WHERE tenant_id = ?"
+        params: list[Any] = [self._tenant_id]
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        if until is not None:
+            sql += " AND ts <= ?"
+            params.append(until)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self._storage.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "evaluated": loads(r["evaluated"]),
+                "acted": loads(r["acted"]),
+                "forward": loads(r["forward"]),
+                "extra": loads(r["extra"]),
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Reference (REFERENCE tier): static lookup documents
+    # ------------------------------------------------------------------
+    @_track_op("set_reference")
+    def set_reference(
+        self,
+        key: str,
+        body: str | dict[str, Any] | list[Any],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Insert or update a REFERENCE-tier document.
+
+        v0.4.0: ``key`` is validated as an identifier (non-empty string, no
+        control characters, length <= 1024). Raises ValidationError on
+        rejection.
+
+        v0.4.12 (beta report VRTX ISSUE-003): ``body`` accepts ``str`` or a
+        JSON-serializable ``dict``/``list``. A mapping/sequence is coerced to a
+        canonical JSON string (sorted keys) and stored as the reference body,
+        so ``set_reference(key, {...})`` no longer raises StorageError on the
+        INSERT. Any other type raises a clear ``ValidationError`` naming the
+        ``body`` parameter instead of failing opaquely inside SQLite."""
+        validate_identifier(key, field_name="key")
+        if isinstance(body, (dict, list)):
+            # Reuse the JSON guard used for metadata: rejects non-serializable
+            # payloads with a typed error before it can reach the DB layer.
+            body = _check_json(body, "body")
+        elif not isinstance(body, str):
+            raise ValidationError(
+                f"body must be a str or a JSON-serializable dict/list, got {type(body).__name__}"
+            )
+        meta_json = _check_json(metadata, "metadata") if metadata is not None else None
+        delta = len(body) + len(key) + (len(meta_json) if meta_json else 0) + 200
+        self._cap_gate.check(proposed_delta_bytes=delta)
+        with self._storage.transaction() as conn:
+            conn.execute(
+                "INSERT INTO reference_documents (tenant_id, doc_key, body, metadata) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(tenant_id, doc_key) DO UPDATE SET body = excluded.body, "
+                "metadata = excluded.metadata, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                (self._tenant_id, key, body, meta_json),
+            )
+            # CAP-2: absolute-footprint recheck inside the same transaction.
+            self._verify_committed_size(conn)
+
+    def get_reference(self, key: str) -> dict[str, Any] | None:
+        with self._storage.connection() as conn:
+            row = conn.execute(
+                "SELECT body, metadata, updated_at FROM reference_documents WHERE tenant_id = ? AND doc_key = ?",
+                (self._tenant_id, key),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"body": row["body"], "metadata": loads(row["metadata"]), "updated_at": row["updated_at"]}
+
+    # ------------------------------------------------------------------
+    # Archive
+    # ------------------------------------------------------------------
+    def archive_entity(self, category: str, name: str, reason: str | None = None) -> dict[str, Any]:
+        """Move an entity to the archive table and delete from the active set.
+
+        T1-3 fix: previously this bypassed the cap-gate. A free user at
+        1.9 MB could archive their largest entities (body copied into
+        archived_entities, doubling footprint temporarily before the
+        DELETE lands) to keep writing past the 5 MB cap. Now gated on
+        the size of the body being copied + 200 bytes overhead. Reads
+        the body first so we know the actual delta. NotFoundError still
+        raised before any cap-gate work.
+        """
+        # CORE-9 (2026-06-25 pre-launch audit): read the row, size the insert,
+        # run the cap-check, and perform the archive write all inside ONE
+        # BEGIN IMMEDIATE transaction. The previous two-phase shape (read +
+        # cap-check in a plain connection, then a separate transaction for the
+        # write) had a TOCTOU window: a concurrent writer could grow the DB
+        # between the cap-check and the archive insert, so a free user near the
+        # cap could still push past it. BEGIN IMMEDIATE takes the write lock up
+        # front, closing the window. NotFoundError still propagates before any
+        # write so a missing entity has no side effect.
+        with self._storage.transaction() as conn:
+            row = conn.execute(
+                "SELECT id, body FROM entities WHERE tenant_id = ? AND category = ? AND name = ?",
+                (self._tenant_id, category, name),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"entity {category}/{name} not found")
+            body_bytes = len(row["body"] or "") if row["body"] else 0
+            # The archive insert copies the body. Delta = body + name + category
+            # + reason + ~200B SQLite/row overhead. Conservative estimate.
+            delta = body_bytes + len(name) + len(category) + len(reason or "") + 200
+            # Cap-check holds the write lock (BEGIN IMMEDIATE), so the size it
+            # reads cannot be perturbed by another writer before our INSERT.
+            self._cap_gate.check(proposed_delta_bytes=delta)
+            arch_id = new_id()
+            conn.execute(
+                "INSERT INTO archived_entities (id, tenant_id, original_entity_id, category, name, body, archive_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (arch_id, self._tenant_id, row["id"], category, name, row["body"], reason),
+            )
+            conn.execute("DELETE FROM entities WHERE id = ?", (row["id"],))
+        return {"archived_id": arch_id, "original_id": row["id"]}
+
+    # ------------------------------------------------------------------
+    # Self-learning + lint (v0.2.0): paid-tier only
+    # ------------------------------------------------------------------
+    # Both convenience entrypoints below gate on tier and raise
+    # TierGateError for free-tier callers. The underlying Learner / Linter
+    # classes remain available for power users via direct import, but
+    # the documented surface is the gated convenience API.
+
+    def learner(self, **kwargs: Any):
+        """Return a Learner bound to this client's storage + tenant.
+
+        Paid-tier only. Lazy import so the lower SDK stays usable without
+        loading the learning module. Threads the client's CapGate into
+        the Learner so accept_proposal calls go through the cap-check
+        (T1-3 fix). Callers can override cap_gate=None explicitly to
+        opt out for tests."""
+        self._require_paid_tier("self-learning")
+        from .learning import Learner
+        kwargs.setdefault("cap_gate", self._cap_gate)
+        return Learner(self._storage, tenant_id=self._tenant_id, **kwargs)
+
+    def learn(self, **kwargs: Any):
+        """Convenience: construct a default Learner and run one pass.
+        Returns a LearningRunReport. Paid-tier only."""
+        return self.learner(**kwargs).run()
+
+    def list_skill_proposals(
+        self, *, status: str = "pending", limit: int = 50,
+    ) -> list[Any]:
+        """Paid-tier only."""
+        return self.learner().list_proposals(status=status, limit=limit)
+
+    def accept_skill_proposal(
+        self, proposal_id: str, *, note: str | None = None,
+    ) -> dict[str, Any]:
+        """Paid-tier only."""
+        return self.learner().accept_proposal(proposal_id, note=note)
+
+    def reject_skill_proposal(
+        self, proposal_id: str, *, note: str | None = None,
+    ) -> dict[str, Any]:
+        """Paid-tier only."""
+        return self.learner().reject_proposal(proposal_id, note=note)
+
+    def lint(self, **kwargs: Any):
+        """Run the local memory linter against this tenant. Returns a
+        LintReport with `.findings`, `.counts`, `.ok`, and `.to_ascii()`.
+
+        Paid-tier only. Free-tier callers raise TierGateError pointing at
+        the upgrade page.
+        """
+        self._require_paid_tier("memory linter")
+        from .lint import Linter
+        # If the caller didn't supply soft_cap_bytes, look up by tier
+        if "soft_cap_bytes" not in kwargs:
+            from .lint import TIER_SOFT_CAPS, DEFAULT_SOFT_CAP_BYTES
+            cap = TIER_SOFT_CAPS.get(self._tier, DEFAULT_SOFT_CAP_BYTES)
+            # Paid tiers map to None: pass a huge cap so the check effectively never fires
+            kwargs["soft_cap_bytes"] = cap if cap is not None else (1 << 62)
+        return Linter(self._storage, tenant_id=self._tenant_id, **kwargs).run()
+
+    # ------------------------------------------------------------------
+    # Free-tier read access (no gating): visibility into the upgrade pressure
+    # ------------------------------------------------------------------
+    def free_tier_status(self) -> dict[str, Any]:
+        """Return current free-tier state: DB size, soft cap, % used.
+
+        Always available regardless of tier: free-tier callers use this
+        to render the "you're at X% of your free cap" upgrade prompt
+        without needing to call the (gated) linter.
+        """
+        from .lint import TIER_SOFT_CAPS, DEFAULT_SOFT_CAP_BYTES
+        # CAP-1: WAL-inclusive sizing so the "% of cap" prompt matches what the
+        # cap gate actually enforces (the main file alone under-reports during
+        # write bursts).
+        db_size = db_size_bytes(self._storage.db_path)
+        cap = TIER_SOFT_CAPS.get(self._tier, DEFAULT_SOFT_CAP_BYTES)
+        # Paid tier → no cap
+        if cap is None:
+            return {
+                "tier": self._tier,
+                "db_size_bytes": db_size,
+                "soft_cap_bytes": None,
+                "pct_used": None,
+                "uncapped": True,
+            }
+        return {
+            "tier": self._tier,
+            "db_size_bytes": db_size,
+            "soft_cap_bytes": cap,
+            "pct_used": db_size / cap if cap else None,
+            "uncapped": False,
+            "at_or_above_warning": db_size >= 0.8 * cap,
+            "at_or_above_cap": db_size >= cap,
+            "upgrade_url": "https://sibyllabs.org/plugin#tier",
+        }
+
+    # ------------------------------------------------------------------
+    # FTS5 search
+    # ------------------------------------------------------------------
+    @_track_op("search_entities")
+    def search_entities(self, query: str, *, limit: int = 20, prefix: bool = False,
+                        category: str | None = None) -> SearchResults:
+        """Full-text search over entity name + category + body via FTS5.
+
+        Returns warm-tier entity rows only. For cross-tier search (entities +
+        state + reference + journal in one call), use ``search()``.
+
+        THE VERDICT CONTRACT (stage 3, 2026-08-31): this is the third and last
+        search entry point in the SDK, and it leaves through the same single
+        ``stamp()`` as the other two. A ``verdicts.SearchResults`` (a ``list``
+        subclass — every existing caller is byte-for-byte unaffected) carrying
+        ``OK`` or ``NO_MATCH``. Like ``search()`` it is a policy-free primitive:
+        no abstention, no relevance gate, so no other cause is reachable, and
+        the ``EMPTY_STORE`` probe is left to whichever surface reports the zero
+        (``verdicts.refine_zero``).
+
+        Query is sanitized as a single FTS5 phrase: column-filter syntax
+        (``name:foo``) and unclosed quotes can't escape into the parser.
+        Set ``prefix=True`` for prefix matching on the final token.
+
+        Pass ``category="<name>"`` to anchor the search to a single entity
+        category (exact match); this removes topical bleed across categories on
+        multi-entity workloads (tester email 19e7e75af0b7780a). Omit to search
+        all categories.
+
+        Returns: list of entity rows. Each row is a dict with keys
+            id, tenant_id, category, name, status, body, created_at, updated_at
+            (body is JSON-deserialized).
+
+        Raises: StorageError on backend failure; empty list on empty / invalid query.
+        """
+        limit = _clamp_limit(limit)  # CORE-5: negative=unbounded; huge=full-scan. Clamp.
+        match_q = _sanitize_fts5_query(query, prefix=prefix)
+        if not match_q:
+            # An empty / invalid query is a zero like any other, and it names a
+            # cause like any other. `tokens_total=0` is what lets explain() say
+            # "the query carried no searchable terms" instead of guessing.
+            return stamp([], no_match_verdict(tokens_total=0))
+        # external-content FTS5: join by rowid back to base table.
+        # _fts_query handles classification (v0.4.0 KAPPA) + corruption
+        # containment (poisoned-index DatabaseError self-heals or returns []).
+        #
+        # !!! CORE-3 TENANT-ISOLATION LOCK (2026-06-25 pre-launch audit) !!!
+        # `AND f.tenant_id = ?` is the ONLY thing keeping this query inside the
+        # caller's tenant. tenant_id is UNINDEXED in the FTS5 table (see
+        # schema.sql), so this is a trailing post-filter, NOT index-enforced
+        # isolation. DO NOT remove, reorder, or make this clause conditional.
+        # Index-level enforcement needs an FTS schema migration that would break
+        # existing DBs — FLAGGED for lead review; guarded for now by this lock +
+        # the zero-cross-tenant-leak regression test (test_core3_tenant_isolation).
+        cat_clause = " AND e.category = ?" if category else ""
+        params = ((match_q, self._tenant_id, category, limit) if category
+                  else (match_q, self._tenant_id, limit))
+        with self._storage.connection() as conn:
+            rows = _fts_query(
+                conn,
+                "SELECT e.id, e.tenant_id, e.category, e.name, e.status, e.body, e.created_at, e.updated_at "
+                "FROM entities_fts f "
+                "JOIN entities e ON e.rowid = f.rowid "
+                "WHERE entities_fts MATCH ? AND f.tenant_id = ?" + cat_clause + " "
+                "ORDER BY rank LIMIT ?",
+                params,
+                "entities_fts",
+            )
+        ents = [self._row_to_entity(r) for r in rows]
+        # v0.4.10: proximity re-rank (see search()). Multi-word, non-prefix only;
+        # re-orders the fetched rows, never drops one.
+        query_tokens = _match_tokens(query)
+        if not prefix and len(query_tokens) >= 2 and len(ents) > 1:
+            keyed = []
+            for idx, e in enumerate(ents):
+                text = " ".join((
+                    _normalize_text(e.get("body")),
+                    _normalize_text(e.get("name", "")),
+                    _normalize_text(e.get("category") or ""),
+                ))
+                keyed.append((_proximity_bucket(query_tokens, text), idx, e))
+            keyed.sort(key=lambda t: (t[0], t[1]))
+            ents = [t[2] for t in keyed]
+        return stamp(ents, ok_verdict())
+
+    @_track_op("search")
+    def search(self, query: str, *, limit: int = 20, prefix: bool = False,
+               tiers: tuple[str, ...] | None = None) -> SearchResults:
+        """Cross-tier search that always says why it returned what it returned.
+
+        THE VERDICT CONTRACT (stage 3, 2026-08-31). Thin wrapper over
+        ``_search_rows`` — the unchanged search body, ladder and all — whose only
+        job is to be the SINGLE EXIT: whatever the ladder inside returns leaves
+        through one ``stamp()`` and arrives carrying a ``verdict``.
+
+        The return is a ``verdicts.SearchResults``: a ``list`` subclass, so every
+        existing caller (``len``, iteration, indexing, ``== []``,
+        ``json.dumps``, ``isinstance(x, list)``) is byte-for-byte unaffected,
+        with ``.verdict`` attached. Only two causes are reachable at this level,
+        because ``search()`` is a policy-free primitive with no abstention and no
+        relevance gate: ``OK`` when rows came back, ``NO_MATCH`` when they did
+        not. A user-facing surface (the CLI, the MCP tool) may pay one probe via
+        ``verdicts.refine_zero`` to upgrade that ``NO_MATCH`` to ``EMPTY_STORE``.
+        The probe is deliberately NOT taken here: ``multi_record_search`` calls
+        this method once per query token, and a COUNT per token would be a real
+        per-query cost for an explanation only the outermost caller needs.
+
+        Which rows come back is unchanged. See ``_search_rows`` below for the
+        search behaviour and its history.
+        """
+        rows = self._search_rows(query, limit=limit, prefix=prefix, tiers=tiers)
+        return stamp(rows, ok_verdict())
+
+    def _search_rows(self, query: str, *, limit: int = 20, prefix: bool = False,
+                     tiers: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Cross-tier search with a zero-hit paraphrase fallback.
+
+        Runs the strict AND + proximity search first (``_search_strict``,
+        unchanged behavior). ONLY when that returns nothing and the query is a
+        multi-word non-prefix query does it retry with relaxed variants
+        (stopwords stripped, then the rarest token). This is strictly additive: a
+        non-empty strict result is returned untouched, so ranking and recall of
+        existing hits cannot regress, and single-token / prefix queries (the
+        multi_record path) never trigger the fallback. (paraphrase recall, beta
+        deadguy 2026-06-14: NL queries miss under strict token-AND.)
+
+        LANG-CORE-STRIP (operator directive, 2026-08-30): the 0.6.0/0.6.1/0.7.0
+        QUERY-TIME rescue layers that used to sit here were removed and this body
+        reverted to its 0.5.0 form. Removed: the F2 unconditional shadow append
+        (the shadow is once again a zero-hit-only fallback), the D2L coverage-
+        gated stem rescue and its selectivity-ordered probe ladder (N3/N3'), and
+        the N2 relaxed-single holdback/backfill that existed only to give that
+        rescue headroom. search() is now exactly: strict head, relaxed variants
+        on zero, zero-hit shadow fallback, nothing else.
+
+        What is deliberately NOT removed: shadow.py in full (the folded-trigram
+        shadow table, its triggers, backfill and diacritic folding are the 0.5.0
+        foundation and the delivery vehicle for the stage-2 write-time
+        normalization), and multi_record.py in full (the abstention side — N4
+        any-df function-word drop, N5 negation abstention, the df==0 abstention
+        and the diagnostics channel — is not part of this removal).
+
+        Rationale: four external evaluation cycles accreted these layers at
+        QUERY time, each one compensating for the previous one's side effects
+        (F2's unconditional append polluted df, N2 held rows back to make room
+        for D2L, N3 reordered D2L's probes, N3' removed its early stop and cost
+        18 junk rows on a single query). The fix belongs at WRITE time. This
+        strip restores a clean base to build that on; it is a deliberate,
+        measured recall regression in Polish, not a bug.
+        """
+        hits = self._search_strict(query, limit=limit, prefix=prefix, tiers=tiers)
+        if prefix:
+            return hits
+        if hits:
+            # THE NON-EMPTY-HEAD APPEND. The strict head is returned first and
+            # untouched, always; the shadow may only extend its tail, under the
+            # decisive guard, and only when it has something the head lacks.
+            #
+            # Two distinct recalls ride on this, and they were closed at different
+            # times for different reasons.
+            #
+            # TWIN MASKING (2026-08-07 Finding 2). A single-token query can be
+            # SATISFIED by a row in the other language and thereby hide the row in
+            # the query's own: 'packshot' porter-matches the English 'packshots'
+            # row, the head is non-empty, and the Polish 'Packshoty produktów' row
+            # is never reached. A whole-query zero gate structurally cannot see
+            # this. It is also the shape multi_record's df probes take, so this is
+            # what makes df truthful for inflected forms.
+            #
+            # LONG NATURAL-LANGUAGE RECALL (LongMemEval parity, 2026-08-31). The
+            # 0.7.0 F2 append also served real recall on MULTI-WORD queries with a
+            # non-empty head, and removing it wholesale made this branch retrieve a
+            # strict SUBSET of 0.7.0 on that workload: 9 of 100 questions lost
+            # answer-bearing context and 2 lost it entirely, because a long
+            # question's strict AND head is often one weak row and everything that
+            # actually answered it arrived in the appended tail. F2's diseases came
+            # from the append being UNGUARDED, not from the append existing, so the
+            # append is back for multi-token queries with the guard in front of it.
+            #
+            # The single exception is a single token the ending rule left alone
+            # ('stock', 'form', 'k8'): those have no inflected form to recover and
+            # no second term to corroborate, so they get no probe at all, which is
+            # what preserves the precision the strip bought.
+            if not _unshortened_single_token(query):
+                hits = self._append_shadow(hits, query, limit=limit, tiers=tiers,
+                                           decisive_only=True)
+            return hits
+        # v0.5.0 multi-language search (spec §4.3): the folded-trigram shadow,
+        # reached ONLY when the strict pass produced nothing, so a non-empty
+        # STRICT result is never reordered or dropped. prefix queries already
+        # returned above (prefix intent != substring fallback). The shadow gives
+        # substring semantics (matches inside an unbroken CJK/Thai/Bantu/compound
+        # token) + a folded copy for the non-decomposable ł/ß/ø/... class, in any
+        # language. Since v0.8.0 it runs the NORMALIZED pass: the same normalizer
+        # the write side used, inflected tokens truncated to a stem, rows ranked
+        # by idf-weighted coverage of the query's content terms.
+        #
+        # ORDER: the relaxed ladder runs FIRST and the shadow last, exactly as in
+        # 0.5.0. An earlier v0.8.0 revision put the shadow first and that was
+        # wrong (adversarial review 2026-08-30, finding 1). The relaxed ladder
+        # searches with FTS5 PORTER, which reaches 'story' from 'stories'; the
+        # shadow only does substring on a fixed-length truncation, and 'stori' is
+        # not a substring of 'story' but IS one of 'historic'. Shadow-first
+        # therefore answered with an unrelated row and the ladder never ran, so
+        # the correct row was LOST — the same shape for entries/centrifuge,
+        # queries/querist, and for every digit-bearing identifier, which is never
+        # shortened and so contributes nothing to the shadow while CORE-11 exists
+        # precisely to give it last-resort recall.
+        # How the two rescues share the space below an empty strict head:
+        #
+        #   stage-1 head (the stopword-stripped CONJUNCTION) wins outright. It
+        #     still required every content token, so it answered the question,
+        #     and it is a PORTER answer, which reaches inflections the shadow's
+        #     fixed-length truncation cannot ('stories' -> 'story').
+        #   stage-2 head (ONE token, last resort) keeps its rows and its order,
+        #     and the shadow is APPENDED after it under the decisive guard. When
+        #     the head already fills the caller's limit there is no room, so the
+        #     head is returned untouched. That is 0.5.0 semantics and it is all
+        #     that happens here.
+        #
+        # NOTHING OVERRIDES THE HEAD. Two revisions of this method carried an
+        # exception that discarded a last-resort head which filled the limit, on
+        # the theory that saturation meant the token had matched indiscriminately.
+        # Both discriminators were refuted by a fresh case that lost correct rows:
+        # saturation alone killed 'quarterly reconciliation' (20 reconciliation
+        # rows replaced by one quartermaster row), and saturation-plus-degraded
+        # killed 'quarterly audits' the same way, because the ladder orders by
+        # raw token LENGTH, a rarity proxy and not a relevance one, so degrading
+        # onto a shorter token is no evidence that the token is wrong. The
+        # exception is deleted rather than narrowed a third time.
+        #
+        # The accepted cost is one query shape: 'termin rozpatrzenia reklamacji'
+        # relaxes to 'termin', which sweeps up the boilerplate phrase in every
+        # stored note and fills the cap with it, so that query is now no better
+        # than released 0.7.0. Deliberate residual, recorded in stage2-report.md
+        # §5 with the acceptance amendment. Ranking a weak head below a better
+        # answer is scoring work, not a query-time special case.
+        relaxed_hits: list[dict[str, Any]] = []
+        for relaxed, _last_resort in _relaxed_query_variants(query):
+            found = self._search_strict(relaxed, limit=limit, prefix=False,
+                                        tiers=tiers)
+            if found:
+                relaxed_hits = found
+                break
+        if relaxed_hits:
+            # Either stage's head keeps its rows and its order, and the shadow is
+            # APPENDED after it under the guard. Until 2026-08-31 a stage-1
+            # conjunction head returned outright with no append, and the
+            # LongMemEval parity run measured what that costs: on 'How much did I
+            # earn at the Downtown Farmers Market on my most recent visit?' the
+            # conjunction answers with one raw session and the row that states the
+            # figure was one guarded probe away. A head is a reason to rank the
+            # shadow below it, not a reason to refuse to look.
+            return self._append_shadow(relaxed_hits, query, limit=limit,
+                                       tiers=tiers, decisive_only=True)
+        return self._shadow_fallback(query, limit=limit, tiers=tiers,
+                                     normalize=True)
+
+    def _append_shadow(self, hits: list[dict[str, Any]], query: str, *, limit: int,
+                       tiers: tuple[str, ...] | None,
+                       decisive_only: bool = False) -> list[dict[str, Any]]:
+        """Append normalized shadow rows after an existing head, de-duped, capped.
+
+        Never reorders, never drops, never re-ranks the head — the head list is
+        returned unchanged when the shadow adds nothing, and the shadow's own rank
+        scale stays positional-only (see shadow._shape_hit)."""
+        if len(hits) >= limit:
+            return hits
+        extra = self._shadow_fallback(query, limit=limit, tiers=tiers,
+                                      normalize=True, decisive_only=decisive_only)
+        if not extra:
+            return hits
+        seen = {(h.get("tier"), h.get("key"), h.get("category")) for h in hits}
+        out = list(hits)
+        # The journal cap is a property of the RESULT, not of one pass. Both
+        # _search_strict and the shadow apply max(1, limit//4) to their own rows;
+        # without this the two caps stack and a contentless journal can retake
+        # the result the cap exists to protect (test_journal_does_not_dominate_
+        # search, 2026-06-02). Count what the head already spent.
+        journal_cap = max(1, limit // 4)
+        journal_used = sum(1 for h in hits if h.get("tier") == "journal")
+        for h in extra:
+            ident = (h.get("tier"), h.get("key"), h.get("category"))
+            if ident in seen:
+                continue
+            if h.get("tier") == "journal":
+                if journal_used >= journal_cap:
+                    continue
+                journal_used += 1
+            seen.add(ident)
+            out.append(h)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _shadow_fallback(self, query: str, *, limit: int = 20,
+                         tiers: tuple[str, ...] | None = None,
+                         normalize: bool = False,
+                         decisive_only: bool = False) -> list[dict[str, Any]]:
+        """Delegate a zero-hit search to the folded-trigram shadow (shadow.py).
+
+        A no-op ``[]`` when the shadow table is absent (a pre-migration or
+        read-only DB), and the shadow's own execution is error-contained
+        (OperationalError/DatabaseError -> ``[]`` + heal), so a broken or missing
+        shadow can never take down the primary search path. Any unexpected error
+        here is swallowed to ``[]`` for the same reason."""
+        # CORE-5: honor the same limit clamp as the primary path so the fallback
+        # can never broaden a negative/huge limit into SQLite's unbounded scan.
+        limit = _clamp_limit(limit)
+        if not limit:
+            return []
+        try:
+            from .shadow import shadow_search
+            with self._storage.connection() as conn:
+                return shadow_search(conn, self._tenant_id, query,
+                                     limit=limit, tiers=tiers,
+                                     normalize=normalize, decisive_only=decisive_only)
+        except Exception:
+            return []
+
+    def _search_strict(self, query: str, *, limit: int = 20, prefix: bool = False,
+                       tiers: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Cross-tier full-text search over entities + state + reference + journal.
+
+        Each hit is tier-tagged so callers know which tier surfaced the match.
+
+        Returns: list of dicts shaped:
+            {
+              "tier":  "entity" | "state" | "reference" | "journal",
+              "key":   <entity name | state key | doc_key | journal id>,
+              "category": <entity category or None>,
+              "body":  <JSON-decoded payload or string>,
+              "snippet": <FTS5 snippet, up to ~120 chars around the match>,
+              "rank":  <FTS5 rank, lower is better>,
+              "ts":    <ISO timestamp: updated_at or journal ts>
+            }
+
+        Ordered by FTS5 rank across the union. The default ``limit`` applies
+        globally (combined across tiers). Pass ``tiers=("entity", "state")``
+        to restrict.
+
+        Query is sanitized as a single FTS5 phrase (see ``search_entities``
+        notes). Empty / invalid queries return [].
+
+        Raises: StorageError on backend failure; ValueError on unknown tier names.
+        """
+        limit = _clamp_limit(limit)  # CORE-5: negative=unbounded; huge=full-scan. Clamp.
+        match_q = _sanitize_fts5_query(query, prefix=prefix)
+        if not match_q:
+            return []
+        allowed = set(tiers) if tiers else {"entity", "state", "reference", "journal"}
+        if tiers:
+            unknown = sorted(allowed - {"entity", "state", "reference", "journal"})
+            if unknown:
+                raise ValueError(
+                    f"unknown tiers: {', '.join(unknown)}; "
+                    "valid: entity, state, reference, journal"
+                )
+        hits: list[dict[str, Any]] = []
+        with self._storage.connection() as conn:
+            # v0.4.0 (KAPPA YELLOW finding): per-tier OperationalError handling
+            # now classifies via _classify_fts5_error. Schema-missing keeps the
+            # previous behavior (skip this tier silently, other tiers continue).
+            # FTS5 syntax / real backend errors raise: the query is bad for
+            # ALL tiers, no point continuing through the union.
+            #
+            # !!! CORE-3 TENANT-ISOLATION LOCK (2026-06-25 pre-launch audit) !!!
+            # EVERY query below carries `AND f.tenant_id = ?` as its ONLY tenant
+            # boundary (tenant_id is UNINDEXED in the FTS5 tables — see
+            # schema.sql — so isolation is a trailing post-filter, not
+            # index-enforced). Dropping the clause from ANY ONE tier leaks that
+            # tier across all tenants. DO NOT remove/reorder/conditionalize.
+            # FLAGGED: index-level enforcement needs an FTS schema migration that
+            # would break existing DBs. Guarded by test_core3_tenant_isolation.
+            if "entity" in allowed:
+                for r in _fts_query(
+                    conn,
+                    "SELECT 'entity' AS tier, e.name AS key, e.category, e.body, "
+                    "       e.updated_at AS ts, "
+                    "       snippet(entities_fts, 2, '[', ']', '...', 12) AS snip, "
+                    "       rank "
+                    "FROM entities_fts f JOIN entities e ON e.rowid = f.rowid "
+                    # CORE-3 lock: tenant boundary — do not remove.
+                    "WHERE entities_fts MATCH ? AND f.tenant_id = ? "
+                    "ORDER BY rank LIMIT ?",
+                    (match_q, self._tenant_id, limit),
+                    "entities_fts",
+                ):
+                    hits.append({
+                        "tier": "entity", "key": r["key"],
+                        "category": r["category"],
+                        "body": loads(r["body"]), "snippet": r["snip"],
+                        "rank": r["rank"], "ts": r["ts"],
+                    })
+            if "state" in allowed:
+                for r in _fts_query(
+                    conn,
+                    "SELECT 'state' AS tier, s.document_key AS key, s.body, "
+                    "       s.updated_at AS ts, "
+                    "       snippet(state_documents_fts, 1, '[', ']', '...', 12) AS snip, "
+                    "       rank "
+                    "FROM state_documents_fts f JOIN state_documents s "
+                    "  ON s.rowid = f.rowid "
+                    # CORE-3 lock: tenant boundary — do not remove.
+                    "WHERE state_documents_fts MATCH ? AND f.tenant_id = ? "
+                    "ORDER BY rank LIMIT ?",
+                    (match_q, self._tenant_id, limit),
+                    "state_documents_fts",
+                ):
+                    hits.append({
+                        "tier": "state", "key": r["key"], "category": None,
+                        "body": loads(r["body"]), "snippet": r["snip"],
+                        "rank": r["rank"], "ts": r["ts"],
+                    })
+            if "reference" in allowed:
+                for r in _fts_query(
+                    conn,
+                    "SELECT 'reference' AS tier, d.doc_key AS key, d.body, "
+                    "       d.updated_at AS ts, "
+                    "       snippet(reference_documents_fts, 1, '[', ']', '...', 12) AS snip, "
+                    "       rank "
+                    "FROM reference_documents_fts f JOIN reference_documents d "
+                    "  ON d.rowid = f.rowid "
+                    # CORE-3 lock: tenant boundary — do not remove.
+                    "WHERE reference_documents_fts MATCH ? AND f.tenant_id = ? "
+                    "ORDER BY rank LIMIT ?",
+                    (match_q, self._tenant_id, limit),
+                    "reference_documents_fts",
+                ):
+                    hits.append({
+                        "tier": "reference", "key": r["key"], "category": None,
+                        "body": r["body"], "snippet": r["snip"],
+                        "rank": r["rank"], "ts": r["ts"],
+                    })
+            if "journal" in allowed:
+                # Journal FTS5 is standalone/contentless: fetch event_id from
+                # the FTS5 table, then join to journal_events by id (TEXT PK)
+                # for typed body fields. Contentless tables can't 'rebuild',
+                # so _fts_query contains corruption by returning [] (tier
+                # skipped) rather than crashing the whole search.
+                #
+                # v0.4.7: cap the journal tier's contribution. Journal entries
+                # are long and share many common terms (Project, Research,
+                # Decision...), so on mixed-keyword queries they were dominating
+                # 50-80% of hits and burying real entities/state/reference. Give
+                # journal at most a quarter of the global limit; the structured
+                # tiers keep the rest. The global rank-sort + limit still applies.
+                journal_limit = max(1, limit // 4) if limit > 0 else 0
+                for r in _fts_query(
+                    conn,
+                    "SELECT 'journal' AS tier, j.id AS key, j.ts, "
+                    "       j.evaluated, j.acted, j.forward, j.extra, "
+                    "       snippet(journal_events_fts, 1, '[', ']', '...', 12) AS snip, "
+                    "       f.rank AS rank "
+                    "FROM journal_events_fts f JOIN journal_events j "
+                    "  ON j.id = f.event_id "
+                    # CORE-3 lock: tenant boundary — do not remove.
+                    "WHERE journal_events_fts MATCH ? AND f.tenant_id = ? "
+                    "ORDER BY f.rank LIMIT ?",
+                    (match_q, self._tenant_id, journal_limit),
+                    "journal_events_fts",
+                ):
+                    hits.append({
+                        "tier": "journal", "key": r["key"], "category": None,
+                        "body": {
+                            "evaluated": loads(r["evaluated"]),
+                            "acted": loads(r["acted"]),
+                            "forward": loads(r["forward"]),
+                            "extra": loads(r["extra"]),
+                        },
+                        "snippet": r["snip"], "rank": r["rank"], "ts": r["ts"],
+                    })
+        # Sort by rank (lower = better in FTS5), with a tier tiebreaker: at
+        # comparable rank the content tiers (entity/state/reference) sort before
+        # the contentless journal tier, whose BM25 scores are not on the same
+        # scale (cross-tier rank comparability, tester email 19e7eb3096b4dae5).
+        _tier_rank = {"entity": 0, "state": 0, "reference": 0, "journal": 1}
+        # v0.4.10: proximity re-rank. For multi-word (non-prefix) queries, bucket
+        # each hit by how tightly it matches (contiguous phrase > tight window >
+        # scattered) and sort by (bucket, rank, tier). This demotes short
+        # "near-negative decoy" rows that share the query tokens in an unrelated
+        # context, without dropping any hit (recall unchanged). Single-token and
+        # prefix queries keep the plain BM25 order, so multi_record_search (which
+        # only issues single-token searches) is unaffected.
+        query_tokens = _match_tokens(query)
+        if not prefix and len(query_tokens) >= 2:
+            keyed = []
+            for h in hits:
+                text = " ".join((
+                    _normalize_text(h.get("body")),
+                    _normalize_text(h.get("key", "")),
+                    _normalize_text(h.get("category") or ""),
+                ))
+                keyed.append((
+                    _proximity_bucket(query_tokens, text),
+                    h["rank"],
+                    _tier_rank.get(h["tier"], 0),
+                    h,
+                ))
+            keyed.sort(key=lambda t: (t[0], t[1], t[2]))
+            hits = [t[3] for t in keyed]
+        else:
+            hits.sort(key=lambda h: (h["rank"], _tier_rank.get(h["tier"], 0)))
+        return hits[:limit]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _verify_committed_size(self, conn: sqlite3.Connection) -> None:
+        """CAP-2: re-check the ABSOLUTE footprint inside the write transaction.
+
+        Called after the INSERT/UPDATE rows are staged but before COMMIT, with
+        the BEGIN IMMEDIATE write lock held. Reads the true logical size
+        (page_count * page_size, which already counts the pending change) and
+        gates on the absolute total rather than the pre-write byte estimate. If
+        the resulting footprint exceeds the cap (and the gate confirms the
+        account is free / over-cap), this raises CapExceededError, and the
+        surrounding transaction rolls back the staged write — so a single
+        near-cap write that would tip the DB over is rejected, not committed.
+        """
+        cap_gate = getattr(self, "_cap_gate", None)
+        if cap_gate is None:
+            return
+        # Hardening #16 (super-patch 2026-07-05): storage.logical_size_bytes
+        # returns 0 on ANY internal error (it catches sqlite3.Error / TypeError /
+        # IndexError and falls back to 0). A 0 here would FAIL OPEN the CAP-2
+        # recheck — check_total_local(0) trivially passes, so a near-cap write
+        # that should tip the DB over the cap would commit silently. But this
+        # method only ever runs INSIDE a write transaction with an INSERT/UPDATE
+        # already staged, so a logical size of 0 is never a legitimate post-write
+        # footprint: it signals the measurement was unavailable. In that case,
+        # fall back to the gate's own db_size_fn (the WAL-inclusive account-level
+        # aggregate_db_size wired in __init__, which never under-counts) before
+        # gating, so the cap is still enforced instead of silently bypassed.
+        try:
+            total = self._storage.logical_size_bytes(conn)
+        except Exception as exc:  # measurement path itself blew up
+            _log.warning(
+                "logical_size_bytes raised during CAP-2 recheck (%s); "
+                "falling back to the cap gate's db_size_fn", exc,
+            )
+            total = 0
+        if not total:  # 0 (or None) => measurement unavailable, DO NOT fail open
+            fallback = self._fallback_committed_size(cap_gate)
+            if fallback is not None:
+                _log.warning(
+                    "CAP-2 recheck got a 0-byte in-transaction size "
+                    "(measurement unavailable); enforcing the cap via the "
+                    "db_size_fn fallback (%d bytes) instead of failing open.",
+                    fallback,
+                )
+                total = fallback
+            else:
+                _log.warning(
+                    "CAP-2 recheck got a 0-byte in-transaction size and no "
+                    "usable db_size_fn fallback; proceeding with 0.",
+                )
+        # check_total_local is LOCAL-ONLY (no network) — it must not block on a
+        # urlopen while we hold the BEGIN IMMEDIATE write lock (2026-06-25 audit
+        # blocker). The pre-write check() already did any server verification.
+        cap_gate.check_total_local(total)
+
+    @staticmethod
+    def _fallback_committed_size(cap_gate: Any) -> int | None:
+        """Best-effort WAL-inclusive size from the cap gate's own db_size_fn.
+
+        Hardening #16 fallback for when the in-transaction logical size is
+        unavailable (returned 0 / raised). The gate is constructed with
+        ``db_size_fn=lambda: aggregate_db_size(storage.db_path)`` — the same
+        account-level, WAL-inclusive measurement the pre-write gate uses — so it
+        is a strictly-not-under-counting substitute for the CAP-2 recheck.
+        Returns a positive byte count, or None if no usable size can be obtained
+        (never raises: a broken fallback must not crash the write path).
+        """
+        size_fn = getattr(cap_gate, "_db_size_fn", None)
+        if size_fn is None:
+            return None
+        try:
+            value = int(size_fn())
+        except Exception:
+            return None
+        return value if value > 0 else None
+
+    def _row_to_entity(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "tenant_id": row["tenant_id"],
+            "category": row["category"],
+            "name": row["name"],
+            "status": row["status"],
+            "body": loads(row["body"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
