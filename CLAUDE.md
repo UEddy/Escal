@@ -127,18 +127,90 @@ The five zero causes are five different decisions:
 | --- | --- | --- |
 | `OK` | Prior patterns found | Compare confidence, maybe auto-handle |
 | `EMPTY_STORE` | Cold start | Escalate and record. Normal, not a failure |
-| `NO_MATCH` | Store populated, nothing similar | Escalate, record as a new pattern |
+| `NO_MATCH` | Store populated, nothing scored well enough | Escalate, record as a new pattern |
 | `GATED` | A scoring gate dropped the query | Escalate, flag match as failed |
 | `NEGATION_ABSTAIN` | Negation policy declined | Escalate, flag match as failed |
-| `ABSTAINED_ON` | Engine abstained on a term | Escalate, flag match as failed |
+| `ABSTAINED_ON` | A query term has zero corpus support | Depends on provenance, see below |
 
-The bottom three are not "never seen before", they are "could not tell".
-Collapsing them into `NO_MATCH` would create a phantom new pattern for a
-situation already handled, and accumulate confidence on a duplicate.
+`GATED` and `NEGATION_ABSTAIN` are not "never seen before", they are "could
+not tell". Collapsing them into `NO_MATCH` would create a phantom new pattern
+for a situation already handled, and accumulate confidence on a duplicate.
 
 Escalation context contains user-supplied text. The gates are what make an
 injection-shaped query return nothing, so treat gated results as a signal, not
 an error to suppress.
+
+#### `ABSTAINED_ON` depends on where the query came from
+
+`ABSTAINED_ON` means one content token has zero corpus support anywhere in the
+store. What that IMPLIES depends on who put the token in the query, so the
+same code is read two ways:
+
+- **The query was built from registered vocabulary values.** The engine is
+  reporting that an exact registered term appears in no stored pattern. That
+  is a *more* confident miss than `NO_MATCH`, not a weaker one: `NO_MATCH`
+  says the scorer found nothing good enough, this says the term is absent from
+  the corpus outright. Treat as a confident miss, `match_failed = False`.
+- **The query carried free text.** The conservative reading stands. The store
+  may well hold the pattern and one unsupported word blocked the search.
+  Treat as a failed match, `match_failed = True`.
+
+This is the ordinary outcome on the vocabulary path, not an edge case: a
+genuinely new situation is a query whose terms have no corpus support, so it
+abstains rather than scoring. A recall that never reclassified would report
+almost every new pattern as "could not tell".
+
+**Read provenance from the blocking token, never from a flag the caller
+passes.** `Verdict.tokens` carries the blocking token, and
+`memory._blocking_token_is_registered` checks it against `VOCABULARY_TOKENS`.
+Gating this way means a future free-text surface inherits the conservative
+reading automatically, with no new argument to remember and no way to assert a
+provenance it does not have. If any reported token is unregistered, or none is
+reported at all, the conservative reading applies.
+
+`VOCABULARY_TOKENS` holds the FTS *tokens* a registered value can produce, not
+the values themselves. The tokenizer is `porter unicode61` and the SDK
+sanitizer keeps alphanumerics and underscores, so a dotted id splits:
+`refund.over_limit` becomes `refund` and `over_limit`, while `issue_refund`
+survives whole. Comparing against raw vocabulary values would miss every
+dotted policy rule.
+
+### Recall must go through `multi_record_search`
+
+`client.search` and `client.search_entities` are policy-free primitives. Their
+own source says so: no abstention, no relevance gate, so **only `OK` and
+`NO_MATCH` are reachable from them**. The other four causes are stamped in
+`multi_record.py`. Measured, not assumed: see `scripts/spike_store.py`.
+
+`client.search` is disqualified for a second, worse reason. It does not
+enforce AND across query tokens. A query carrying one token with zero corpus
+support still returns rows (`"flibbertigibbet refund"` returns 20 rows and
+`OK`, where the same query returns zero from the other two), so its `NO_MATCH`
+is weak evidence and cannot anchor a confidence counter.
+`multi_record_search` suppresses the query and names the blocking token.
+
+`multi_record_search` is a semi-public engine: reachable as a submodule, named
+without a leading underscore, documented as the canonical search path, but
+absent from the package top-level exports and from any `__all__`, and never
+called by `client.py`. Treat the import as the one place upstream can break
+us. It is wrapped behind `memory._search_patterns`, which is the only call
+site in the project, so a break is a one-function fix.
+
+Details that differ from the rest of the SDK surface:
+
+- `limit` defaults to **10**, where `client.search` defaults to 20. Pass it
+  explicitly.
+- It is cross-tier with **no `category` or `tiers` kwarg**. Journal rows do
+  surface, and on those `key` is an event UUID and `category` is `None`.
+  Filter on `row["tier"] == "entity"` and `row["category"] ==
+  "escalation_pattern"` before treating any `key` as a signature, or
+  `get_entity` will raise `NotFoundError`.
+- Rows come back in `client.search` shape (`tier`, `key`, `category`, `body`,
+  `snippet`, `rank`, `ts`), **not** `search_entities` shape. There is no
+  `name` field; for entity-tier rows the signature is in `key`.
+- It reports `EMPTY_STORE` natively, so `refine_zero` is not needed on this
+  path.
+- The `diagnostics` kwarg is deprecated upstream. Use `result.verdict`.
 
 ## Signature design
 

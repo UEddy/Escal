@@ -14,11 +14,18 @@ against the per-account cap forever. tmp_path is removed by pytest, so
 cleanup needs no fixture teardown of its own.
 """
 
+import re
+
 import pytest
 from sibyl_memory_client import VerdictCode
+from sibyl_memory_client.verdicts import Verdict
 
 from memory import (
     DEV_TENANT,
+    VOCABULARY_TOKENS,
+    _blocking_token_is_registered,
+    _classify_match_failure,
+    _search_patterns,
     PATTERN_CATEGORY,
     TEST_TENANT,
     THRESHOLD_STATE_KEY,
@@ -179,23 +186,110 @@ def test_populated_store_miss_is_not_empty_store(warm):
 
 
 def test_a_genuinely_new_situation_abstains_rather_than_no_match(warm):
-    """Pins surprising upstream behaviour, documented in recall_pattern.
+    """Pins the upstream behaviour the provenance rule is built on.
 
-    The fallback query is built from vocabulary terms. When a situation is
-    genuinely new, those terms have zero corpus support, and the engine
-    reports ABSTAINED_ON rather than NO_MATCH. For a natural-language query
-    that would mean "one word blocked the search". For a vocabulary-only
-    query it means "no stored pattern uses these terms", which is closer to a
-    confident miss than to an unanswerable one.
-
-    We still classify it as match_failed, which is the conservative reading
-    and what the CLAUDE.md table prescribes. Both paths escalate, so the
-    behaviour is identical either way; only the journal label differs.
+    The fallback query carries only vocabulary terms, so a genuinely new
+    situation is a query whose terms have no corpus support, and the engine
+    abstains rather than scoring. ABSTAINED_ON, not NO_MATCH, is the ordinary
+    outcome on this path.
     """
     recall = recall_pattern(warm, OTHER_FIELDS)
     assert recall.verdict_code is VerdictCode.ABSTAINED_ON
-    assert recall.match_failed is True
+    assert recall.blocking_tokens
+
+
+def test_abstention_on_a_registered_token_is_a_confident_miss(warm):
+    """Provenance case 1: we built the query, so a blocked token means that
+    exact registered term appears in no stored pattern. More confident than
+    NO_MATCH, not less."""
+    recall = recall_pattern(warm, OTHER_FIELDS)
+    assert recall.verdict_code is VerdictCode.ABSTAINED_ON
+    assert recall.match_failed is False
+    assert all(t in VOCABULARY_TOKENS for t in recall.blocking_tokens)
+    # Still escalates: a confident miss is a miss.
+    assert recall.found is False
     assert recall.should_auto_handle(0.8) is False
+
+
+def test_abstention_on_an_unregistered_token_stays_conservative(warm):
+    """Provenance case 2: a hypothetical free-text surface. The blocking
+    token is not one our vocabularies can produce, so the store may well hold
+    the pattern and one unsupported word blocked the search."""
+    results = _search_patterns(warm, "flibbertigibbet refund")
+    assert results.verdict.code is VerdictCode.ABSTAINED_ON
+    assert results.verdict.tokens == ["flibbertigibbet"]
+    assert "flibbertigibbet" not in VOCABULARY_TOKENS
+    assert _classify_match_failure(results.verdict) is True
+
+
+def test_provenance_is_read_from_the_token_not_asserted_by_the_caller(warm):
+    """The gate takes no provenance argument, so a future free-text caller
+    inherits the conservative reading with nothing to remember."""
+    import inspect
+
+    params = inspect.signature(_classify_match_failure).parameters
+    assert list(params) == ["verdict"]
+    params = inspect.signature(_blocking_token_is_registered).parameters
+    assert list(params) == ["verdict"]
+
+
+def test_vocabulary_tokens_cover_dotted_values():
+    """A dotted id splits on the dot, so the blocking token is a fragment.
+    Comparing against raw vocabulary values would miss every policy rule."""
+    assert "refund.over_limit" not in VOCABULARY_TOKENS
+    assert "refund" in VOCABULARY_TOKENS
+    assert "over_limit" in VOCABULARY_TOKENS
+    # Underscored values survive whole.
+    assert "issue_refund" in VOCABULARY_TOKENS
+    assert "policy_rule_unresolved" in VOCABULARY_TOKENS
+
+
+def test_every_vocabulary_value_contributes_at_least_one_token():
+    from signature import VOCABULARIES
+
+    for field_name, vocabulary in VOCABULARIES.items():
+        for value in vocabulary:
+            pieces = [p for p in re.split(r"[^0-9a-zA-Z_]+", value) if p]
+            assert pieces, (field_name, value)
+            assert all(p in VOCABULARY_TOKENS for p in pieces), (field_name, value)
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [(VerdictCode.GATED, True), (VerdictCode.NEGATION_ABSTAIN, True),
+     (VerdictCode.NO_MATCH, False), (VerdictCode.EMPTY_STORE, False),
+     (VerdictCode.OK, False)],
+)
+def test_other_verdicts_classify_independently_of_tokens(code, expected):
+    """Only ABSTAINED_ON consults the token. GATED and NEGATION_ABSTAIN stay
+    failures whatever token they name."""
+    verdict = Verdict(code=code, tokens=["issue_refund"])
+    assert _classify_match_failure(verdict) is expected
+
+
+def test_abstention_with_no_reported_token_stays_conservative():
+    """Defensive. If the engine ever abstains without naming a token we
+    cannot establish provenance, so we must not claim a confident miss."""
+    verdict = Verdict(code=VerdictCode.ABSTAINED_ON, tokens=[])
+    assert _classify_match_failure(verdict) is True
+
+
+def test_a_mixed_token_abstention_stays_conservative():
+    """If any reported token is unregistered, provenance is not established
+    for the whole query."""
+    verdict = Verdict(
+        code=VerdictCode.ABSTAINED_ON, tokens=["issue_refund", "flibbertigibbet"]
+    )
+    assert _classify_match_failure(verdict) is True
+
+
+def test_journal_records_the_blocking_token(warm):
+    """A reclassification has to be auditable after the fact."""
+    recall = recall_pattern(warm, OTHER_FIELDS)
+    journal_escalation(warm, recall, threshold=0.8, escalated=True)
+    event = warm.read_events()[0]
+    assert event["evaluated"]["blocking_tokens"] == recall.blocking_tokens
+    assert event["evaluated"]["match_failed"] is False
 
 
 def test_recall_is_stable_across_clients(tmp_path):

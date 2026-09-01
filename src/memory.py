@@ -33,6 +33,7 @@ time.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -62,6 +63,7 @@ __all__ = [
     "PENDING_STATE_KEY",
     "DEFAULT_SEARCH_LIMIT",
     "CONFIDENCE_PRIOR_WEIGHT",
+    "VOCABULARY_TOKENS",
     "MemoryNotInitializedError",
     "RecallSource",
     "PatternRecall",
@@ -116,9 +118,11 @@ class RecallSource:
 class PatternRecall:
     """The outcome of a recall, carrying enough to make the escalation call.
 
-    `found` alone is never enough. A zero has five different causes and three
-    of them mean "could not tell" rather than "never seen", so `match_failed`
-    separates them. See the verdict table in CLAUDE.md.
+    `found` alone is never enough. A zero has five different causes, and
+    whether a given one means "could not tell" or "not present" is what
+    `match_failed` records. For ABSTAINED_ON that depends on the blocking
+    token, so the two are not interchangeable. See the verdict table in
+    CLAUDE.md.
     """
 
     signature: str
@@ -126,10 +130,19 @@ class PatternRecall:
     source: str
     verdict_code: VerdictCode | None
     body: dict[str, Any] | None = None
-    #: True when a scoring gate, a negation policy, or an abstention dropped
-    #: the query. The store may well hold this pattern; the search could not
-    #: say. Treating this as "new" would mint a duplicate and split a counter.
+    #: True when the search could not answer: a scoring gate, a negation
+    #: policy, or an abstention on a token we do not own. The store may well
+    #: hold this pattern. Treating that as "new" would mint a duplicate and
+    #: split a counter.
+    #:
+    #: False for an abstention on a token our own vocabularies produced,
+    #: which is a confident miss rather than a failure. See
+    #: _blocking_token_is_registered.
     match_failed: bool = False
+    #: The token the engine reported as blocking, when it reported one. Kept
+    #: for the journal so a reclassification is auditable after the fact.
+    #: Comes from the query we built, never from a stored record.
+    blocking_tokens: list[str] = field(default_factory=list)
     #: Rows the fuzzy pass returned that were not the exact key, for the
     #: journal. Signatures only, never bodies.
     near_misses: list[str] = field(default_factory=list)
@@ -244,12 +257,85 @@ def _utc_now() -> str:
 # Recall
 # --------------------------------------------------------------------------
 
-#: The three causes that mean "could not tell" rather than "never seen".
+#: Causes that always mean "could not tell" rather than "never seen".
+#: ABSTAINED_ON is deliberately absent: its meaning depends on what the
+#: blocking token was. See _blocking_token_is_registered.
 _MATCH_FAILED_CODES = frozenset({
     VerdictCode.GATED,
     VerdictCode.NEGATION_ABSTAIN,
-    VerdictCode.ABSTAINED_ON,
 })
+
+
+# Mirrors the SDK sanitizer's token rule: alphanumerics and underscores are
+# token characters, everything else separates.
+_TOKEN_SPLIT_RE = re.compile(r"[^0-9a-zA-Z_]+")
+
+
+def _vocabulary_tokens() -> frozenset[str]:
+    """Every FTS token a registered vocabulary value can produce.
+
+    Not the vocabulary values themselves. The FTS5 tokenizer is
+    'porter unicode61' and the SDK sanitizer keeps alphanumerics and
+    underscores, so a dotted id splits:
+
+        refund.over_limit           -> refund, over_limit
+        account.identity_unverified -> account, identity_unverified
+        issue_refund                -> issue_refund
+
+    which means the token the engine reports as blocking is often a fragment
+    of a registered value rather than the value itself. Comparing against the
+    raw vocabulary would miss every dotted policy rule.
+    """
+    tokens: set[str] = set()
+    for vocabulary in VOCABULARIES.values():
+        for value in vocabulary:
+            for piece in _TOKEN_SPLIT_RE.split(value):
+                if piece:
+                    tokens.add(piece.lower())
+    return frozenset(tokens)
+
+
+VOCABULARY_TOKENS = _vocabulary_tokens()
+
+
+def _blocking_token_is_registered(verdict) -> bool:
+    """Whether an ABSTAINED_ON was blocked by a term we own.
+
+    ABSTAINED_ON means one content token has zero corpus support anywhere in
+    the store. What that IMPLIES depends entirely on where the token came
+    from, which is why this reads the token rather than trusting a flag the
+    caller passes.
+
+    If the blocking token is one our vocabularies can produce, the engine has
+    told us that this exact registered term appears in no stored pattern.
+    That is a MORE confident miss than NO_MATCH, not a weaker one: NO_MATCH
+    says the scorer found nothing good enough, while this says the term is
+    absent from the corpus outright.
+
+    If the blocking token is anything else, some free-text surface put a word
+    in the query and the conservative reading stands: the store may well hold
+    the pattern and one unsupported word blocked the search.
+
+    Gating on the token rather than on a provenance flag means a future
+    free-text caller inherits the conservative reading automatically, with no
+    new argument to remember to pass and no way to assert a provenance it does
+    not have.
+    """
+    tokens = getattr(verdict, "tokens", None) or []
+    if not tokens:
+        # ABSTAINED_ON should always name its token. If it ever does not, we
+        # cannot establish provenance, so we stay conservative.
+        return False
+    return all(token.lower() in VOCABULARY_TOKENS for token in tokens)
+
+
+def _classify_match_failure(verdict) -> bool:
+    """True when a zero means 'could not tell' rather than 'not present'."""
+    if verdict.code in _MATCH_FAILED_CODES:
+        return True
+    if verdict.code is VerdictCode.ABSTAINED_ON:
+        return not _blocking_token_is_registered(verdict)
+    return False
 
 
 def recall_pattern(client: MemoryClient, fields: dict[str, Any]) -> PatternRecall:
@@ -263,20 +349,13 @@ def recall_pattern(client: MemoryClient, fields: dict[str, Any]) -> PatternRecal
     because the verdict on a zero distinguishes a cold start from a genuine
     miss from a search that could not answer.
 
-    ONE VERDICT READS DIFFERENTLY HERE THAN THE CLAUDE.md TABLE SUGGESTS.
-    That table describes natural-language queries, where ABSTAINED_ON means
-    "one unsupported word blocked the whole query" and the store may well
-    hold the answer. Our fallback query is built from vocabulary terms only,
-    so when it abstains the engine is reporting that no stored pattern uses
-    any of these terms, which is closer to a confident miss than to an
-    unanswerable question. In practice a genuinely new situation reaches this
-    function as ABSTAINED_ON far more often than as NO_MATCH.
-
-    It is still classified as match_failed, which is the conservative
-    reading. Nothing behavioural turns on it: every zero escalates, and
-    record_outcome writes the pattern regardless of the recall verdict. Only
-    the journal label differs. Revisit if the label starts misleading anyone
-    reading the audit log.
+    ABSTAINED_ON is the common outcome here, not NO_MATCH. Our fallback query
+    carries only vocabulary terms, so a genuinely new situation is a query
+    whose terms have no corpus support, and the engine abstains rather than
+    scoring. That reads as a CONFIDENT miss: the engine is reporting that
+    these exact registered terms appear in no stored pattern. See
+    _blocking_token_is_registered for why the reclassification is gated on
+    the blocking token rather than on the caller's word.
     """
     signature = escalation_signature(fields)
 
@@ -333,7 +412,8 @@ def recall_pattern(client: MemoryClient, fields: dict[str, Any]) -> PatternRecal
         source=RecallSource.NONE,
         verdict_code=verdict_code,
         body=None,
-        match_failed=verdict_code in _MATCH_FAILED_CODES,
+        match_failed=_classify_match_failure(results.verdict),
+        blocking_tokens=list(getattr(results.verdict, "tokens", None) or []),
         near_misses=[row["key"] for row in matches if row.get("key")],
     )
 
@@ -467,6 +547,7 @@ def journal_escalation(
         "found": recall.found,
         "verdict": recall.verdict_code.value if recall.verdict_code else None,
         "match_failed": recall.match_failed,
+        "blocking_tokens": recall.blocking_tokens,
         "confidence": recall.confidence,
         "times_seen": recall.times_seen,
         "threshold": threshold,
