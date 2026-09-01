@@ -22,28 +22,28 @@ file:
 
 | Tier | Operation | Where |
 | --- | --- | --- |
-| WARM entity | **write** the pattern, counters, confidence | `src/memory.py:518` in `record_outcome` |
-| WARM entity | **read** the pattern by exact key | `src/memory.py:367` in `recall_pattern` |
-| WARM entity | **search** fallback when the key misses | `src/memory.py:222` in `_search_patterns` |
-| COLD journal | **write** one event per escalation | `src/memory.py:570` in `journal_escalation` |
-| HOT state | **write** the confidence threshold | `src/memory.py:585` in `set_threshold` |
-| HOT state | **read** the threshold | `src/memory.py:596` in `get_threshold` |
-| REFERENCE | **write** the escalation policy | `src/agent.py:251` in `publish_policy` |
-| REFERENCE | **read** the policy for the startup check | `src/agent.py:269` in `check_policy_consistency` |
+| WARM entity | **write** the pattern, counters, confidence | [`src/memory.py:518`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L518) in `record_outcome` |
+| WARM entity | **read** the pattern by exact key | [`src/memory.py:367`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L367) in `recall_pattern` |
+| WARM entity | **search** fallback when the key misses | [`src/memory.py:222`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L222) in `_search_patterns` |
+| COLD journal | **write** one event per escalation | [`src/memory.py:570`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L570) in `journal_escalation` |
+| HOT state | **write** the confidence threshold | [`src/memory.py:585`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L585) in `set_threshold` |
+| HOT state | **read** the threshold | [`src/memory.py:596`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L596) in `get_threshold` |
+| REFERENCE | **write** the escalation policy | [`src/agent.py:251`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/agent.py#L251) in `publish_policy` |
+| REFERENCE | **read** the policy for the startup check | [`src/agent.py:269`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/agent.py#L269) in `check_policy_consistency` |
 
 **The one function to read if you only read one:** `recall_pattern`
-(`src/memory.py:341`). It is the decision point. Exact key first, then a
+([`src/memory.py:341`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L341)). It is the decision point. Exact key first, then a
 fallback search, then a branch on which of five reasons a zero result came
 back with. Whether the agent escalates or acts turns entirely on what this
 returns.
 
 **The two-minute path through the repo:**
 
-1. `src/signature.py:390`, `escalation_signature` derives a stable key from
+1. [`src/signature.py:390`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/signature.py#L390), `escalation_signature` derives a stable key from
    the agent's structured state, never from customer text, so two customers
    phrasing one problem differently land on one pattern.
-2. `src/memory.py:341`, `recall_pattern` looks that key up.
-3. `src/agent.py:405`, `handle_request` is the loop: resolve, stall, recall,
+2. [`src/memory.py:341`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L341), `recall_pattern` looks that key up.
+3. [`src/agent.py:405`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/agent.py#L405), `handle_request` is the loop: resolve, stall, recall,
    auto-handle or escalate, record.
 
 ## How memory made this possible
@@ -66,11 +66,11 @@ Two tests, side by side in `tests/test_agent.py`, run the identical request
 sequence through the identical code. The only variable is whether the store
 has a history.
 
-- `test_without_the_store_every_request_escalates` (`tests/test_agent.py:484`)
+- `test_without_the_store_every_request_escalates` ([`tests/test_agent.py:484`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/tests/test_agent.py#L484))
   runs six requests, each against a fresh store. All six escalate. A human is
   asked six times.
 - `test_the_same_agent_with_the_store_does_stop_escalating`
-  (`tests/test_agent.py:497`) runs the same six against one kept store. The
+  ([`tests/test_agent.py:497`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/tests/test_agent.py#L497)) runs the same six against one kept store. The
   human is asked fewer than six times, because the agent stops needing them.
 
 Run just those two:
@@ -152,7 +152,7 @@ repository and reflects the actual order the work was done in, starting from
 an empty directory.
 
 Confidence and pattern logic are hand-written in `derive_confidence`
-(`src/memory.py:426`). Sibyl's `learn` and `lint` are paid-tier features and
+([`src/memory.py:426`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L426)). Sibyl's `learn` and `lint` are paid-tier features and
 are not used.
 
 ## Layout
