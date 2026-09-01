@@ -1,16 +1,20 @@
-# escalation-memory
+# Escal
 
 **An escalation memory layer for production agents.** When a support agent
 hits something it cannot resolve and hands off to a human, that handoff is
 normally forgotten the moment the ticket closes, so the hundredth identical
-escalation costs a human exactly as much as the first. This system persists
-what stalled the agent, what the human decided, and whether that decision
-held up, then recalls it on the next occurrence to decide whether to escalate
-again or handle it directly.
+escalation costs a human exactly as much as the first. Escal persists what
+stalled the agent, what the human decided, and whether that decision held up,
+then recalls it on the next occurrence to decide whether to escalate again or
+handle it directly.
 
 The people with this problem are anyone running an agent with a human in the
 loop: support, trust and safety, ops. Their escalation queue never gets
 shorter, because the agent never learns from the queue.
+
+## Demo video
+
+**Link goes here before submission.** Placeholder, must not ship empty.
 
 ---
 
@@ -48,8 +52,8 @@ returns.
 
 ## How memory made this possible
 
-The system has no other state. Confidence is not a heuristic recomputed at
-runtime; it is an accumulated count of how often a human agreed with a stored
+Escal has no other state. Confidence is not a heuristic recomputed at runtime;
+it is an accumulated count of how often a human agreed with a stored
 resolution, and that count exists only in Sibyl. With no persistent store
 there are no patterns, so there is nothing to calibrate against, so every
 escalation goes to a human, forever. The agent still runs. It just never
@@ -59,6 +63,61 @@ There is deliberately no fallback path. No try/except degrades to a local
 dict, no cache answers a recall the store could not, and `get_threshold`
 raises rather than returning a default, because a hardcoded default would be
 calibration the module invented rather than read.
+
+## Setup
+
+Python 3.10 or newer. Developed and verified on 3.14.
+
+    git clone https://github.com/UEddy/Escal.git
+    cd Escal
+
+Create and activate a virtual environment.
+
+macOS and Linux:
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+
+Windows PowerShell:
+
+    python -m venv .venv
+    .venv\Scripts\Activate.ps1
+
+Install. `requirements.txt` is the single runtime dependency;
+`requirements-dev.txt` adds pytest and is needed to run the tests.
+
+    pip install -r requirements.txt
+    pip install -r requirements-dev.txt
+
+That is the whole setup. Every command below assumes the venv is active, so
+plain `python` is the right interpreter on all platforms.
+
+Verify:
+
+    python -m pytest tests -q
+
+Expect `225 passed`.
+
+### You do not need a Sibyl account
+
+**Verified, not assumed:** the full test suite and all three demo modes run
+with no credentials present at all. Escal calls `MemoryClient.local(...)`,
+which is local SQLite. It creates its own store and never requires activation.
+
+`sibyl init` exists and opens a browser to activate a free account, but it is
+**optional here**. Activating unlocks the `sibyl` CLI inspection commands
+(`sibyl status`, `sibyl whoami`, `sibyl memory`) and server-side tier
+verification for the storage cap. Nothing in this repo depends on any of that.
+Without credentials the SDK simply behaves as free tier locally.
+
+The free tier is sufficient regardless. Escal uses no paid-tier features:
+Sibyl's `learn` and `lint` are gated on paid tiers and are not used, and all
+confidence logic is hand-written in `derive_confidence`
+([`src/memory.py:426`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L426)).
+
+> **Windows only:** if console output raises `UnicodeEncodeError`, set
+> `$env:PYTHONIOENCODING="utf-8"` first. This is a Windows cp1252 console
+> issue and is not needed on macOS or Linux.
 
 ## The deletion test
 
@@ -75,11 +134,11 @@ has a history.
 
 Run just those two:
 
-    .venv/Scripts/python.exe -m pytest tests/test_agent.py -k "without_the_store or same_agent_with_the_store" -v
+    python -m pytest tests/test_agent.py -k "without_the_store or same_agent_with_the_store" -v
 
 Full suite, 225 tests:
 
-    .venv/Scripts/python.exe -m pytest tests -q
+    python -m pytest tests -q
 
 ## Running the demo
 
@@ -87,10 +146,9 @@ Three separate process invocations, not three function calls. The point being
 demonstrated is that the only thing crossing the process boundary is Sibyl,
 and one process could not show that.
 
-    $env:PYTHONIOENCODING="utf-8"
-    .venv/Scripts/python.exe scripts/demo.py phase1
-    .venv/Scripts/python.exe scripts/demo.py phase2
-    .venv/Scripts/python.exe scripts/demo.py no-memory
+    python scripts/demo.py phase1
+    python scripts/demo.py phase2
+    python scripts/demo.py no-memory
 
 `phase1` must run before `phase2`. It resets its store so every run starts
 cold, then handles three identical stalls with a scripted human agreeing each
@@ -139,9 +197,11 @@ roughly 1,400 further events before this store alone would reach the cap.
 
 ## Partner stacks
 
-**None used. Multiplier 1.00.** The project uses Sibyl Memory only
+**None used. Multiplier 1.00.** Escal uses Sibyl Memory only
 (`sibyl-memory-client==0.8.0`). No partner technologies were integrated, and
-no multiplier is claimed.
+no multiplier is claimed. The only third-party import anywhere in `src/` or
+`scripts/` is `sibyl_memory_client`; everything else is the Python standard
+library.
 
 ## Prior work declaration
 
@@ -151,24 +211,22 @@ adapted prior project, and no template. The full commit history is in the
 repository and reflects the actual order the work was done in, starting from
 an empty directory.
 
-Confidence and pattern logic are hand-written in `derive_confidence`
-([`src/memory.py:426`](https://github.com/UEddy/Escal/blob/ec91ba4395f20190b918ca315896e9712afd2ee8/src/memory.py#L426)). Sibyl's `learn` and `lint` are paid-tier features and
-are not used.
-
 ## Layout
 
-    src/signature.py   Pure key derivation. No Sibyl import, no IO.
-    src/memory.py      The Sibyl layer. Every read and write.
-    src/agent.py       The refund agent that produces escalations.
-    scripts/demo.py    The three-mode scripted demo.
-    scripts/spike_*.py Throwaway measurement spikes, kept for their findings.
-    tests/             225 tests, real store, no mocks.
-    CLAUDE.md          Design decisions and the verified Sibyl API surface.
-
-## Environment
-
-Windows, PowerShell, Python 3.14, venv at `.venv`. Set
-`PYTHONIOENCODING=utf-8` before running anything that prints.
+    src/signature.py       Pure key derivation. No Sibyl import, no IO.
+    src/memory.py          The Sibyl layer. Every read and write.
+    src/agent.py           The refund agent that produces escalations.
+    scripts/demo.py        The three-mode scripted demo.
+    scripts/spike_*.py     Throwaway measurement spikes, kept for their findings.
+    tests/                 225 tests, real store, no mocks.
+    docs/api-actual.txt    Sibyl 0.8.0 API surface dumped from the installed
+                           package. The PyPI README is stale; this is the
+                           source of truth every design decision was checked
+                           against.
+    CLAUDE.md              Design decisions and the verified Sibyl API surface.
+    requirements.txt       Runtime dependency, pinned.
+    requirements-dev.txt   Adds pytest, for running the suite.
+    requirements-lock.txt  Full transitive record of the dev environment.
 
 ## License
 

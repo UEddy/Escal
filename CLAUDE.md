@@ -1,4 +1,4 @@
-# escalation-memory
+# Escal
 
 An escalation memory layer for production agents. When an agent hands off to a
 human, the system persists the trigger, the human's decision, and the outcome.
