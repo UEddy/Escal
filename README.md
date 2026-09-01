@@ -66,7 +66,16 @@ calibration the module invented rather than read.
 
 ## Setup
 
-Python 3.10 or newer. Developed and verified on 3.14.
+**Developed and tested on Python 3.14.** That is the only version it has been
+run on.
+
+Likely compatible with 3.9 or newer, untested. That floor comes from static
+analysis rather than from inference: the only version-gated syntax is PEP 585
+generic annotations such as `dict[str, Any]`, and stdlib usage bottoms out at
+3.7 (`dataclasses`, `from __future__ import annotations`). Because every
+module defers annotation evaluation with `from __future__ import annotations`,
+and nothing calls `get_type_hints` or subscripts a generic at runtime, it may
+well run on 3.7; 3.9 is the conservative number.
 
     git clone https://github.com/UEddy/Escal.git
     cd Escal
